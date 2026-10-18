@@ -1,0 +1,23 @@
+projects:
+  items:
+    - name: sample-gateway
+      path: sample-gateway
+      description: 示例入口服务
+      packages: [dev.example.gateway]
+      tags: [入口, API, gateway]
+      rpc_to: [sample-content-service]
+
+    - name: sample-content-service
+      path: sample-content-service
+      description: 示例内容领域服务
+      packages: [dev.example.content]
+      tags: [内容, 聚合, content]
+      called_by: [sample-gateway]
+      rpc_to: [sample-storage-service]
+
+    - name: sample-storage-service
+      path: sample-storage-service
+      description: 示例数据存储服务
+      packages: [dev.example.storage]
+      tags: [存储, 数据, persistence]
+      called_by: [sample-content-service]

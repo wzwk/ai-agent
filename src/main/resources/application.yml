@@ -1,0 +1,172 @@
+server:
+  port: 8082
+  servlet:
+    encoding:
+      charset: UTF-8
+      force: true
+  # 静态资源 gzip 压缩：mermaid.min.js 3.3MB → ~850KB，隧道首屏提速 3~4 倍
+  compression:
+    enabled: true
+    mime-types: text/html,text/css,text/javascript,application/javascript,application/json
+    min-response-size: 1024
+
+spring:
+  config:
+    # 本地私密配置，不进入 Git；生产环境也可以直接使用环境变量覆盖
+    import: optional:file:./config/local-secrets.properties
+  application:
+    name: product-ai-bot
+  profiles:
+    active: dev
+  mvc:
+    async:
+      # SSE 流式回答（/api/chat/stream）可能持续数分钟，默认 30s 异步超时会把连接掐断
+      # 后端 trace 最长探索 8 分钟，预留决策尾部和最终成文时间，避免先被 MVC 掐断成空响应。
+      request-timeout: 960000
+  # ===== 阶段一持久化（PostgreSQL，PG 未启动时自动降级内存，不影响问答）=====
+  # 示例使用 5433 端口；可通过环境变量或本地私密配置覆盖
+  datasource:
+    url: jdbc:postgresql://localhost:5433/aitest
+    username: aitest
+    password: ${PG_PASSWORD:}
+    hikari:
+      # -1 = 启动时不试连（PG 没起也允许应用启动），失败进入 5 分钟冷却重试
+      initialization-fail-timeout: -1
+      maximum-pool-size: 4
+      connection-timeout: 3000
+
+# ===== LLM 配置 =====
+llm:
+  # 当前激活的 provider：deepseek | zhipu
+  # 2026-10-14：默认切智谱（团队版 Coding Plan），deepseek 保留为备选
+  active: ${LLM_ACTIVE:zhipu}
+  providers:
+    deepseek:
+      # OpenAI 兼容端点
+      base-url: https://api.deepseek.com/v1
+      # 优先读取环境变量 DEEPSEEK_API_KEY，也可由本地 local-secrets.properties 提供
+      api-key: ${DEEPSEEK_API_KEY:}
+      model: deepseek-chat
+      temperature: 0.3
+      max-tokens: 8192
+    zhipu:
+      # 团队版 Coding Plan 专用端点（普通密钥请改回 https://open.bigmodel.cn/api/paas/v4）
+      base-url: https://open.bigmodel.cn/api/coding/paas/v4
+      # 优先读取环境变量 ZHIPU_API_KEY，也可由本地 local-secrets.properties 提供
+      api-key: ${ZHIPU_API_KEY:}
+      model: glm-5.2
+      # 智能体决策轮专用快模型（选工具无需深度推理）：glm-5.2 决策轮单次 20-40s，flash 约 1/4；
+      # 成文轮仍用主模型保证回答质量。BYOK 访客自带 key 时此配置不生效。
+      # 复杂跨服务链路需要稳定的多工具规划；glm-4/4.5 flash 实测虽有快请求，
+      # 但会漏工具或在大上下文退化，保留已验证闭环质量的 5.3 flash。
+      decision-model: glm-5.3-flash
+      temperature: 0.3
+      # glm-5.x 为推理模型，思考 token 也计入此额度，需留足正文空间
+      max-tokens: 16384
+
+# ===== 访问控制（暴露给他人时务必配置） =====
+app:
+  auth:
+    # 为空 = 不启用鉴权；配置后 /api/** 需带 X-Auth-Token 头或 ?token= 参数
+    token: ${APP_AUTH_TOKEN:}
+  share:
+    # 每个会话可用共享 Key 免费提问的次数；访客自带 Key 时不占额度。
+    # 自己日常使用建议调大（或环境变量 FREE_QUESTIONS=999），对外分享时设为 1
+    free-questions: ${FREE_QUESTIONS:1}
+  # 语义缓存（v0.9 词法版 → v0.12 向量升级：bge-m3 主路 + bigram Jaccard 兜底）
+  semantic-cache:
+    enabled: true
+    ttl-hours: 72          # 过期弃用（代码会变，缓存答案有时效）
+    threshold: 0.93        # 词法相似度阈值（兜底路），宁紧勿松
+    vector-threshold: 0.80 # 向量余弦阈值（主路）。实测校准：同题换措辞 0.85+，不同题 ≤0.60，取中间偏稳值
+    scan-limit: 300        # 每次扫描近期条数（词法兜底路）
+  # ===== RAG（阶段二：本地向量检索，embedding 不出内网）=====
+  rag:
+    enabled: ${RAG_ENABLED:true}
+    embedding:
+      # 明确使用 IPv4；部分 Windows/JDK 21 环境把 localhost 优先解析为 ::1，
+      # 而 Ollama 默认只监听 127.0.0.1，会导致命令行可用但应用探活失败。
+      base-url: ${OLLAMA_URL:http://127.0.0.1:11434}
+      model: bge-m3            # 1024 维；换模型须改 rag_chunks.vector(N) 并全量重建
+      dimension: 1024
+      # CPU 上一次嵌入 32 个长切片可能超过 60 秒；小批次降低超时重试和整文件回滚风险。
+      batch-size: ${OLLAMA_BATCH_SIZE:8}
+      # 超大 Java 文件允许单批最多计算 5 分钟；仍保留上限，避免 Ollama 异常永久卡住索引任务。
+      timeout-ms: ${OLLAMA_TIMEOUT_MS:300000}
+    index:
+      max-chars: 1800
+      chunk-lines: 70
+  agent:
+    # 智能体引擎总开关：false 走旧 workflow 管线（灰度兜底 + 评测对比）。
+    # 2026-08-31 默认切 true：workflow 无 search_docs，FAQ 处理类问题结构性答不了
+    # （真实案例：云盘容量缓存清理，FAQ#54 有直接答案却给出 messy 代码分析）；
+    # golden 集 FAQ 命中 workflow 0% vs agent 100%。engine=workflow 字段仍可显式回退。
+    enabled: ${AGENT_ENABLED:true}
+    # legacy=原自由循环；trace=全部走调用链状态图；hybrid=普通问答保留旧引擎，
+    # 明确深挖/接口分析走状态图。保留 legacy 便于演示前一键回退。
+    # 默认 hybrid：普通 FAQ/线上处理问题走轻量 Agent；明确深挖、接口分析或指定项目才走状态图。
+    # 全量 trace 会把“团队 token 失效怎么处理”这类已有 FAQ 的问题误当调用链任务，浪费时间扫描源码。
+    executor: ${AGENT_EXECUTOR:hybrid}
+    # 各模式步数预算（决策轮数；全局硬顶 40 不可突破）
+    mode-budgets: { user: 8, analyze: 10, dev: 12 }
+    # 普通 user 口吻也可以深挖；最后一轮仍发现新线索可追加收尾轮次。
+    deep-trace-budget: 10
+    deep-trace-grace-turns: 2
+    # 单问累计 token 二道闸
+    token-budget: 400000
+    # 状态图会自动批量实读候选并程序化判定闭环；8 分钟足以覆盖复杂链路，
+    # 同时确保最终成文能在 Spring/SSE 超时前返回明确 complete/partial 终态。
+    trace-max-explore-ms: 480000
+    # 状态提交/最终成文只携带最近关键材料，完整调用边仍保存在状态图
+    trace-commit-context-bytes: 24000
+    trace-final-context-bytes: 36000
+    # 只自动读取 pending edge 的精确符号候选；不再把普通 Top 命中整批灌入上下文
+    trace-auto-expand-files: 2
+    # 工具结果累计上限（字节），超限压缩最旧工具结果
+    context-cap-bytes: 100000
+    # 单个工具结果上限（字节）
+    tool-result-cap-bytes: 12000
+
+# ===== 项目元数据配置 =====
+projects:
+  config-location: classpath:projects.yml
+  # 本地代码根目录（projects.yml 里的 path 是相对这个根的）
+  # Docker 部署时通过 -v 挂载代码目录并用 CODE_BASE 环境变量覆盖
+  code-base: ${CODE_BASE:./sample-code}
+
+# ===== 代码检索配置 =====
+search:
+  # 每个项目检索后保留的 top N 文件
+  top-n-per-project: 5
+  # LLM 最终精读的文件数上限（含引用发现补搜的下游服务文件）
+  max-files-to-llm: 8
+  # 单个文件读取的最大行数（避免超大文件吃满 token）
+  max-lines-per-file: 300
+  # 忽略的目录
+  exclude-dirs: [target, .git, .idea, node_modules, build, dist]
+  # 忽略的文件扩展名
+  exclude-exts: [".class", ".jar", ".war", ".log", ".bin"]
+  # 跨项目有界并行；过大反而会造成磁盘争用
+  parallelism: 4
+  # 目录遍历结果短缓存；内容仍用 path + size + mtime 精确失效
+  file-list-cache-ttl-ms: 10000
+  # 文件内容 LRU：避免每次问题都重新读盘和重复转小写
+  # 当前约 3.8 万代码/配置文件，640MB 是保守估算上限；JDK Compact String 实占通常更低
+  content-cache-max-entries: 50000
+  content-cache-max-mb: 640
+  # 类名/接口名精确定位索引；只索引 Java 文件路径，不复制源码内容。
+  symbol-index-ttl-ms: 60000
+
+# ===== 企微配置（PoC 阶段先留空） =====
+wecom:
+  enabled: false
+  corp-id: ""
+  agent-id: ""
+  secret: ""
+  callback-token: ""
+  callback-aes-key: ""
+
+logging:
+  level:
+    dev.example.productai: DEBUG
+    org.springframework.web: INFO
