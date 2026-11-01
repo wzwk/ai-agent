@@ -28,16 +28,16 @@ public class AgentProperties {
 
     /** 各模式步数预算；硬顶 HARD_CAP_BUDGET 不可突破 */
     private Map<String, Integer> modeBudgets = Map.of(
-            "user", 6,
-            "analyze", 12,
-            "dev", 18
+            "user", 16,
+            "analyze", 24,
+            "dev", 32
     );
 
     /** 用户明确要求追完整链路时使用的探索预算，不改变回答口吻。 */
-    private int deepTraceBudget = 12;
+    private int deepTraceBudget = 48;
 
     /** 深度追踪在最后一轮仍发现新线索时允许的收尾轮数。 */
-    private int deepTraceGraceTurns = 2;
+    private int deepTraceGraceTurns = 16;
 
     /** 无需额外 LLM 分类即可识别的深度追踪表达，可通过配置覆盖。 */
     private List<String> deepTraceKeywords = List.of(
@@ -47,25 +47,34 @@ public class AgentProperties {
     );
 
     /** 单问累计 token 二道闸（触发后强制成文） */
-    private int tokenBudget = 400_000;
+    private int tokenBudget = 1_000_000;
+
+    /** 状态图长链路的累计 token 二道闸；只提高闭环调查预算，不改变最终模型或材料窗口。 */
+    private int traceTokenBudget = 2_000_000;
 
     /** trace 探索阶段墙钟预算；到点保存 checkpoint 并成文，后续可继续。 */
-    private long traceMaxExploreMs = 240_000;
+    private long traceMaxExploreMs = 1_800_000;
+
+    /** trace 连续无新增证据时的停止阈值；期间会要求模型改走精确符号或提供方项目。 */
+    private int traceMaxNoProgressRounds = 5;
 
     /** trace 收尾状态提交使用的最近材料上限（字符）。 */
-    private int traceCommitContextBytes = 24_000;
+    private int traceCommitContextBytes = 12_000;
+
+    /** trace 决策消息窗口；完整事实另存在 TraceState/AgentHarvest，不在每轮重复回传全部旧原文。 */
+    private int traceDecisionContextBytes = 48_000;
 
     /** trace 最终成文使用的最近材料上限（字符）；完整状态图另行提供。 */
-    private int traceFinalContextBytes = 36_000;
+    private int traceFinalContextBytes = 64_000;
 
     /** 每轮模型检索后由程序自动批量实读的候选文件数，减少“搜索一轮、读文件一轮”的往返。 */
     private int traceAutoExpandFiles = 2;
 
     /** 单工具执行超时（毫秒） */
-    private int toolTimeoutMs = 10_000;
+    private int toolTimeoutMs = 60_000;
 
     /** 工具结果累计上限（字节），超限压缩最旧的工具结果 */
-    private int contextCapBytes = 100_000;
+    private int contextCapBytes = 160_000;
 
     /** 单个工具结果上限（字节） */
     private int toolResultCapBytes = 12_000;
@@ -73,7 +82,7 @@ public class AgentProperties {
     public int budgetFor(String mode) {
         Integer v = modeBudgets.get(mode);
         if (v == null) v = modeBudgets.get("user");
-        return Math.min(v == null ? 6 : v, HARD_CAP_BUDGET);
+        return Math.min(v == null ? 16 : v, HARD_CAP_BUDGET);
     }
 
     /** 回答模式只控制口吻；探索深度由本次问题单独决定。 */
@@ -96,5 +105,5 @@ public class AgentProperties {
     }
 
     /** 全局硬顶：任何配置不得突破，防失控循环 */
-    public static final int HARD_CAP_BUDGET = 40;
+    public static final int HARD_CAP_BUDGET = 80;
 }

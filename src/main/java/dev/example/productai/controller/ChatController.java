@@ -46,7 +46,7 @@ public class ChatController {
     @Data
     public static class ChatRequest {
         private String question;
-        /** 回答模式：user（默认，口语化）/ dev（开发者，含 mermaid 流程图） */
+        /** 回答模式：user（默认，口语化）/ dev（开发者；流程图须显式请求） */
         private String mode;
         /** 会话 ID；为空时服务端生成。多轮对话需带回 */
         private String sessionId;
@@ -61,7 +61,7 @@ public class ChatController {
         /** ===== 接口分析模式字段 ===== */
         /** 指定检索的项目名；非空时跳过 LLM 路由 */
         private List<String> projects;
-        /** 接口路径，如 /api/v3/commodity/multiPriceSkuVersionSave */
+        /** 接口路径，如 /api/v1/items/save */
         private String apiPath;
         /** 分析目标：梳理逻辑 / 排查报错等 */
         private String intent;
@@ -212,7 +212,7 @@ public class ChatController {
             long startedAt = System.currentTimeMillis();
             if (cancellable) LlmCancellation.bind(LlmCancellation.register(requestId));
             try {
-                ChatResponse resp = agent.askStream(ctx, new dev.example.productai.agent.AgentExecutor.StreamHooks(
+                ChatResponse resp = agent.askStream(ctx, new dev.example.productai.agent.AgentStreamHooks(
                         step -> writeSseQuietly(out, "step", toJsonQuietly(step)),
                         delta -> writeSseQuietly(out, "delta", toJsonQuietly(delta))
                 ));

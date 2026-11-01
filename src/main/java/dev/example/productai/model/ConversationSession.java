@@ -52,6 +52,16 @@ public class ConversationSession {
         return new ArrayList<>(history);
     }
 
+    /** 最终答复追加范围说明后，同步修正会话中刚写入的成文内容。 */
+    public synchronized void replaceLastAssistantAnswer(String original, String replacement) {
+        ChatMessage last = history.peekLast();
+        if (last != null && "assistant".equals(last.getRole())
+                && java.util.Objects.equals(original, last.getContent())) {
+            last.setContent(replacement);
+            touch();
+        }
+    }
+
     /** 共享 Key 提问次数 +1，返回累加后的值 */
     public int incrAskedCount() {
         return askedCount.incrementAndGet();

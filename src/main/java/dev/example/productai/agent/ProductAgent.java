@@ -41,7 +41,7 @@ import java.util.regex.Pattern;
  *
  * 支持双模式：
  *   - user：面向业务用户的口语化回答
- *   - dev：面向研发的排查向回答，开头强制输出 mermaid 流程图
+ *   - dev：面向研发的排查向回答；流程图按显式请求生成，用户格式要求优先
  *
  * 支持多轮对话：通过 sessionId 关联历史，最终答题 LLM 可看到最近 N 轮 Q&A。
  
@@ -83,8 +83,10 @@ public class ProductAgent {
     }
 
     /** SSE 版入口：hooks 非空时步骤/成文增量实时回调（引擎须为 agent 才有流式效果） */
-    public ChatResponse askStream(AskContext c, AgentExecutor.StreamHooks hooks) {
+    public ChatResponse askStream(AskContext c, AgentStreamHooks hooks) {
         long start = System.currentTimeMillis();
+        prepareExplicitProjectContext(c);
+        prepareInterfaceAnalysisContext(c);
         String question = c.getQuestion();
         String effectiveMode = (c.getMode() == null || c.getMode().isBlank()) ? "user" : c.getMode().trim().toLowerCase();
         LlmRuntime rt = c.getRt();
@@ -94,43 +96,140 @@ public class ProductAgent {
                 c.getSpecifiedProjects() == null ? "自动路由" : c.getSpecifiedProjects());
 
         ConversationSession session = conversationStore.getOrCreate(c.getSessionId());
+        List<ChatMessage> history = session.snapshot();
+        boolean scopeBareBatchDeleteAnswer = needsBatchDeleteScopeNote(c, history);
         boolean deepTrace = agentProps.isDeepTraceRequest(question, c.getIntent());
         boolean traceEngine = useAgentEngine(c) && useTraceEngine(c);
         boolean directFaqRequest = "user".equals(effectiveMode) && AgentExecutor.isDirectFaqQuestion(question);
+        boolean responsePreferencePinned = c.hasExplicitResponsePreference();
+        boolean forceRefresh = isCacheBypassRequest(question)
+                || shouldRecheckBatchDeleteScenario(question, history);
+        String cacheVariant = c.cacheVariant(effectiveMode);
 
         boolean defaultEngine = c.getEngine() == null || c.getEngine().isBlank();
         // trace 只允许命中“同题 + COMPLETE + trace 引擎 + 引用源码未变化”的严格缓存；
         // legacy/workflow 继续使用原有高阈值语义缓存。显式指定 engine=trace 表示强制重查。
-        if (defaultEngine && traceEngine) {
-            SemanticCacheService.CacheHit hit = semanticCache.findVerifiedExact(question, effectiveMode);
-            if (hit != null) {
+        if (!forceRefresh && !responsePreferencePinned && defaultEngine && traceEngine) {
+            SemanticCacheService.CacheHit hit = semanticCache.findVerifiedExact(question, cacheVariant);
+            if (hit != null && cachedAnswerMatchesResponsePreference(c, hit.answer())) {
                 ChatResponse resp = cachedResponse(hit, session, effectiveMode, start);
+                qualifyBatchDeleteAnswer(resp, scopeBareBatchDeleteAnswer, null);
                 session.append(new ChatMessage("user", question));
-                session.append(new ChatMessage("assistant", hit.answer()));
+                session.append(new ChatMessage("assistant", resp.getAnswer()));
                 persistence.saveTurn(session, effectiveMode, question, resp);
                 return resp;
             }
-        } else if (defaultEngine && !deepTrace && !directFaqRequest) {
-            SemanticCacheService.CacheHit hit = semanticCache.find(question, effectiveMode);
-            if (hit != null) {
+        } else if (!forceRefresh && !responsePreferencePinned && defaultEngine && !deepTrace && !directFaqRequest) {
+            SemanticCacheService.CacheHit hit = semanticCache.find(question, cacheVariant);
+            if (hit != null && cachedAnswerMatchesResponsePreference(c, hit.answer())) {
                 ChatResponse resp = cachedResponse(hit, session, effectiveMode, start);
+                qualifyBatchDeleteAnswer(resp, scopeBareBatchDeleteAnswer, null);
                 session.append(new ChatMessage("user", question));
-                session.append(new ChatMessage("assistant", hit.answer()));
+                session.append(new ChatMessage("assistant", resp.getAnswer()));
                 persistence.saveTurn(session, effectiveMode, question, resp);
                 return resp;
             }
-        } else if (deepTrace || traceEngine) {
-            log.info("显式状态图请求绕过缓存，重新验证当前代码. sessionId={}", session.getSessionId());
+        } else if (forceRefresh || deepTrace || traceEngine) {
+            log.info("请求要求重新调查，绕过答案缓存并验证当前代码. sessionId={}", session.getSessionId());
         }
 
         ChatResponse resp = doAsk(c, session, effectiveMode, rt, byok, start, hooks);
+        String originalAnswer = resp.getAnswer();
+        if (qualifyBatchDeleteAnswer(resp, scopeBareBatchDeleteAnswer, hooks)) {
+            session.replaceLastAssistantAnswer(originalAnswer, resp.getAnswer());
+        }
         // 高质量答案入语义缓存（重复问题秒回；低置信度不缓存——错误放大器）
-        if (defaultEngine) {
-            semanticCache.store(question, effectiveMode, resp);
+        if (defaultEngine && !responsePreferencePinned) {
+            semanticCache.store(question, cacheVariant, resp);
         }
         // 阶段一持久化：统一在出口落库（agent/workflow 两引擎全覆盖；失败降级内存不影响回答）
         persistence.saveTurn(session, effectiveMode, question, resp);
         return resp;
+    }
+
+    static boolean isCacheBypassRequest(String question) {
+        if (question == null || question.isBlank()) return false;
+        String normalized = question.replaceAll("\\s+", "");
+        return normalized.contains("不能命中缓存")
+                || normalized.contains("不要命中缓存")
+                || normalized.contains("不用缓存")
+                || normalized.contains("不使用缓存")
+                || normalized.contains("绕过缓存")
+                || normalized.contains("强制重查")
+                || normalized.contains("重新查")
+                || normalized.contains("重新检索")
+                || normalized.contains("重新搜索");
+    }
+
+    /** 换删除对象或追问其他场景时，当前问题不能套用上一条泛称问题的商品答案。 */
+    static boolean shouldRecheckBatchDeleteScenario(String question, List<ChatMessage> history) {
+        if (question == null || question.isBlank()) return false;
+        String current = question.replaceAll("\\s+", "");
+        if (current.contains("批量删除") && !isBareBatchDeleteEndpointQuestion(current)) return true;
+        if (history == null || history.isEmpty()) return false;
+        String previousQuestion = null;
+        String previousAnswer = null;
+        for (int i = history.size() - 1; i >= 0; i--) {
+            ChatMessage message = history.get(i);
+            if (previousAnswer == null && "assistant".equals(message.getRole())) {
+                previousAnswer = message.getContent();
+            } else if ("user".equals(message.getRole())) {
+                previousQuestion = message.getContent();
+                break;
+            }
+        }
+        if (previousQuestion == null || previousAnswer == null
+                || !previousQuestion.contains("批量删除")
+                || current.equals(previousQuestion.replaceAll("\\s+", ""))) return false;
+        return current.length() <= 50 && (current.contains("删除") || current.contains("话术")
+                || current.contains("脚本") || current.contains("定时") || current.contains("其他")
+                || current.contains("别的") || current.contains("场景") || current.startsWith("那")
+                || current.endsWith("呢") || current.startsWith("换成") || current.startsWith("如果是"));
+    }
+
+    /** 泛称问题照常回答；没有紧邻的明确对象时，给单一商品接口答案补充范围说明。 */
+    static boolean needsBatchDeleteScopeNote(AskContext context, List<ChatMessage> history) {
+        if (context == null || context.getQuestion() == null
+                || (context.getSpecifiedProjects() != null && !context.getSpecifiedProjects().isEmpty())
+                || context.detectedApiPath() != null) return false;
+        if (!isBareBatchDeleteEndpointQuestion(context.getQuestion())) return false;
+        if (history != null) {
+            for (int i = history.size() - 1; i >= 0; i--) {
+                ChatMessage previous = history.get(i);
+                if (!"user".equals(previous.getRole())) continue;
+                String prior = previous.getContent();
+                if (prior != null && prior.contains("批量删除")
+                        && !isBareBatchDeleteEndpointQuestion(prior)) return false;
+                break;
+            }
+        }
+        return true;
+    }
+
+    static boolean qualifyBatchDeleteAnswer(ChatResponse response, boolean needsScopeNote,
+                                            AgentStreamHooks hooks) {
+        if (!needsScopeNote || response == null || Boolean.TRUE.equals(response.getNeedKey())) return false;
+        String answer = response.getAnswer();
+        if (answer == null || !answer.contains("/api/v1/items/batch/delete")
+                || answer.contains("这里按商品批量删除回答")
+                || answer.contains("其他对象也有各自的批量删除接口")) return false;
+        String suffix = "\n\n这里按商品批量删除回答；其他对象也有各自的批量删除接口。";
+        response.setAnswer(answer + suffix);
+        if (hooks != null && hooks.onDelta() != null) hooks.onDelta().accept(suffix);
+        return true;
+    }
+
+    private static boolean isBareBatchDeleteEndpointQuestion(String text) {
+        if (text == null) return false;
+        String normalized = text.replaceAll("\\s+", "")
+                .replaceAll("[？?。！!啊呀呢]+$", "");
+        return normalized.matches("^(?:请问|帮我查下|帮我查一下|帮我查|帮我找一下|帮我找|查下|查一下|查|找)?"
+                + "批量删除(?:的|对应的)?接口(?:是哪个|是哪一个|是什么|在哪|在哪里|地址是什么|路径是什么)?$");
+    }
+
+    private boolean cachedAnswerMatchesResponsePreference(AskContext context, String answer) {
+        if (context.useFlowchart()) return true;
+        return answer == null || !answer.toLowerCase().contains("```mermaid");
     }
 
     private ChatResponse cachedResponse(SemanticCacheService.CacheHit hit,
@@ -149,7 +248,7 @@ public class ProductAgent {
 
     private ChatResponse doAsk(AskContext c, ConversationSession session, String effectiveMode,
                                LlmRuntime rt, boolean byok, long start,
-                               AgentExecutor.StreamHooks hooks) {
+                               AgentStreamHooks hooks) {
         String question = c.getQuestion();
 
         // 免费额度检查：未自带 Key 且本会话共享额度已用完 => 引导配置自己的 Key
@@ -259,7 +358,7 @@ public class ProductAgent {
         }
 
         // Step 2b: 引用发现 —— 扫描首轮命中文件的 import，识别路由没覆盖到的下游服务
-        // （如 storage-service / search-service），用代码级证据自动补一轮检索。
+        // （如 core-service / commoditysearch），用代码级证据自动补一轮检索。
         Map<String, Set<String>> discoveredRefs = searcher.discoverReferences(
                 hits.subList(0, Math.min(hits.size(), 12)), loader.getProjects(), 12);
         List<String> discoveredNames = new ArrayList<>();
@@ -402,19 +501,23 @@ public class ProductAgent {
             String facts = llm.chat(factSystem, factUser, rt);
             log.debug("dev 两阶段事实底稿:\n{}", facts);
 
-            String system = c.useFlowchart() ? buildDevSystemPrompt(route) : buildDevNoFlowchartPrompt(route);
+            boolean concise = c.usesBriefAnswer();
+            String system = concise
+                    ? buildDevConciseSystemPrompt(route)
+                    : (c.useFlowchart() ? buildDevSystemPrompt(route) : buildDevNoFlowchartPrompt(route));
             String goalSuffix = (c.getIntent() != null && !c.getIntent().isBlank())
                     ? "\n用户的分析目标：" + c.getIntent() : "";
-            String user = buildFinalDevUserPrompt(question + goalSuffix, route, facts, historyBlock);
+            String user = buildFinalDevUserPrompt(question + goalSuffix, route, facts, historyBlock,
+                    c.useFlowchart(), concise);
             llmResp = llm.chat(system, user, rt);
         } else {
-            String system = buildUserSystemPrompt(route);
+            String system = buildUserSystemPrompt(route, c.usesBriefAnswer());
             String user = buildAnswerUserPrompt(question, route, ctx.toString(), historyBlock, effectiveMode);
             llmResp = llm.chat(system, user, rt);
         }
 
         String[] parsed = parseConfidence(llmResp);
-        String answer = parsed[0];
+        String answer = c.enforceOutputPreferences(parsed[0]);
         String confidence = parsed[1];
         boolean needHuman = "low".equalsIgnoreCase(confidence);
 
@@ -618,20 +721,39 @@ public class ProductAgent {
         if ("dev".equals(mode)) {
             return buildDevSystemPrompt(route);
         }
-        return buildUserSystemPrompt(route);
+        return buildUserSystemPrompt(route, true);
     }
 
-    /** user 模式：面向业务用户，口语化，禁标题 */
-    private String buildUserSystemPrompt(RouteResult route) {
+    /** user 模式：默认业务简报；用户明确要求实现细节时再展开。 */
+    private String buildUserSystemPrompt(RouteResult route, boolean brief) {
+        if (brief) {
+            return """
+                    你是本地项目的代码问答助手。提问者是业务用户，默认只需要可以直接使用的最终结果，
+                    内部检索和代码调查过程不要原样展示给他。
+
+                    回答要求：
+                    1) 严格依据提供的代码或文档，第一句话直接回答“结果是什么”。
+                    2) 通常只补充 1～3 条真正影响使用或判断的条件、操作或例外；没有必要就只写一段。
+                    3) 默认不展开调用链、类名、方法名、数据库表、搜索过程和架构背景；
+                       只有缺少这些信息会让结论产生歧义时，才简短点出一个关键技术落点。
+                    4) 线上处理问题优先给可执行步骤；配置问题直接给配置名、字段和值；
+                       是/否问题先明确回答“是”或“不是”，再补一句依据。
+                    5) 不生成 Mermaid、流程图、汇总表或多级标题，不复述用户问题。
+                    6) 通常控制在 80～250 个中文字符；材料不足时用一句话说明还缺什么，不编造。
+
+                    回答最末尾追加一行：[CONFIDENCE:high] 或 [CONFIDENCE:medium] 或 [CONFIDENCE:low]
+
+                    当前命中项目：""" + route.getProjectNames();
+        }
         return """
-                你是商品研发团队的内部 AI 助手，像组里熟代码的同事在企微群里回答提问一样，自然、直接、口语化。
+                你是本地项目的代码问答助手，像熟悉代码的同事回答提问一样，自然、直接、口语化。
 
                 内容要求：
                 1) 严格基于提供的代码内容回答，不要编造不存在的类、方法、字段。
                 2) 第一句话先给直接结论（接口在哪、谁来处理、走什么数据源），不要先铺垫"基于提供的代码…"。
                 3) 讲关键逻辑时要落到具体实现：方法名、核心分支判断、数据源（库/表/缓存/MQ），并给出文件引用。
                 4) 涉及调用链路时，按 入口 → 处理 → 数据层 的顺序讲，可以用箭头 → 串起来。
-                5) 文件引用直接内联在句子里，格式：[相对路径:行号]，例如 [PersonalAlbumController.java:205]。
+                5) 文件引用直接内联在句子里，格式：[相对路径:行号]，例如 [ItemController.java:205]。
                    不要单独列"参考文件"段落，也不要把引用当成段落结尾的点缀。
                 6) 代码不足以回答时，直接说"这批代码里没看到 xxx，建议补充 yyy"，不要硬答。
 
@@ -655,10 +777,10 @@ public class ProductAgent {
                 当前命中项目：""" + route.getProjectNames();
     }
 
-    /** dev 模式：面向研发排查，强制 mermaid 流程图开头 */
+    /** dev 模式显式要求流程图时使用。 */
     private String buildDevSystemPrompt(RouteResult route) {
         return """
-                你是商品研发团队的内部 AI 助手，当前处于"开发者排查模式"。提问者是工程师，目的是搞清楚调用链路、定位问题、看代码细节。
+                你是本地项目的代码问答助手，当前处于"开发者排查模式"。提问者是工程师，目的是搞清楚调用链路、定位问题、看代码细节。
                 你会拿到一份「已核实的代码事实清单」，它是唯一事实来源；你的任务是把清单组织成一份结构清晰、可追溯的排查文档。
 
                 内容要求：
@@ -701,9 +823,33 @@ public class ProductAgent {
                 当前命中项目：""" + route.getProjectNames();
     }
 
+    /** dev 简洁回答：用户显式格式要求优先于研发模式的长报告骨架。 */
+    private String buildDevConciseSystemPrompt(RouteResult route) {
+        return """
+                你是本地项目的代码问答助手。用户已经明确要求简洁回答或只要某类结论，
+                该要求优先于开发者排查模式的默认模板。
+
+                要求：
+                1) 严格基于事实清单，第一句话直接给结论，只回答用户点名要的内容。
+                2) 不生成 Mermaid/流程图，不写逐跳模板，不附汇总表，不展开无关架构背景。
+                3) 如果用户问“改什么配置”，直接给配置中心、配置名、字段和值；必要条件用短列表补充。
+                4) 保留必要的文件和行号引用；材料不足时用一句话说明缺口。
+                5) 通常控制在 100～350 字，除非用户明确要求详细展开。
+
+                回答最末尾追加一行：[CONFIDENCE:high] 或 [CONFIDENCE:medium] 或 [CONFIDENCE:low]
+
+                当前命中项目：""" + route.getProjectNames();
+    }
+
     /** dev 成文阶段：不再重复喂代码，以事实底稿为唯一依据 */
     private String buildFinalDevUserPrompt(String question, RouteResult route,
-                                           String facts, String historyBlock) {
+                                           String facts, String historyBlock,
+                                           boolean flowchart, boolean concise) {
+        String formatInstruction = concise
+                ? "只给用户要求的直接结论；禁止流程图、逐跳模板和汇总表。"
+                : flowchart
+                    ? "按系统指令成文：mermaid 流程图 -> 逐跳模板 -> 汇总表 -> 末尾 [CONFIDENCE:xxx]。"
+                    : "按系统指令成文：不要生成 mermaid，直接逐跳说明并给汇总表，末尾追加 [CONFIDENCE:xxx]。";
         return """
                 用户问题：%s
 
@@ -717,15 +863,15 @@ public class ProductAgent {
                 已核实的代码事实清单（唯一可信来源，禁止引入清单之外的类/方法/行号）：
                 %s
 
-                请按系统指令的固定骨架成文：mermaid 流程图 -> 逐跳模板 -> 汇总表 -> 末尾 [CONFIDENCE:xxx]。
+                本轮输出要求：%s
                 """.formatted(question, route.getProjectNames(), route.getFeatureNames(),
-                historyBlock.isEmpty() ? "(无)" : historyBlock, facts);
+                historyBlock.isEmpty() ? "(无)" : historyBlock, facts, formatInstruction);
     }
 
     /** dev 模式无流程图变体：结构与标准 dev 一致，但不要求 mermaid（省 token） */
     private String buildDevNoFlowchartPrompt(RouteResult route) {
         return """
-                你是商品研发团队的内部 AI 助手，当前处于"开发者排查模式"。提问者是工程师，目的是搞清楚调用链路、定位问题、看代码细节。
+                你是本地项目的代码问答助手，当前处于"开发者排查模式"。提问者是工程师，目的是搞清楚调用链路、定位问题、看代码细节。
                 你会拿到一份「已核实的代码事实清单」，它是唯一事实来源；你的任务是把清单组织成一份结构清晰、可追溯的排查文档。
                 本次回答不生成 mermaid 流程图，直接按逐跳模板展开。
 
@@ -812,13 +958,105 @@ public class ProductAgent {
         String request = c.getEngine() == null ? "" : c.getEngine().trim().toLowerCase();
         if ("trace".equals(request)) return true;
         if ("legacy".equals(request)) return false;
+        // 指定项目 + 精确接口 + 配置/开关定位有自己的可信终点，不应套用
+        // “必须追到 DB/Redis/MQ”的调用链门禁。显式 trace 或“查到底”仍走状态图。
+        if (c.isTargetedConfigLookup()) return false;
+        if (c.isTargetedGatewayLookup()) return false;
+        if (c.isInterfaceLogicQuestion()) return true;
         String configured = agentProps.getExecutor() == null
                 ? "hybrid" : agentProps.getExecutor().trim().toLowerCase();
         if ("trace".equals(configured)) return true;
         if ("legacy".equals(configured)) return false;
         return agentProps.isDeepTraceRequest(c.getQuestion(), c.getIntent())
                 || (c.getApiPath() != null && !c.getApiPath().isBlank())
-                || (c.getSpecifiedProjects() != null && !c.getSpecifiedProjects().isEmpty());
+                || (!c.isProjectScopeInferred()
+                    && c.getSpecifiedProjects() != null && !c.getSpecifiedProjects().isEmpty());
+    }
+
+    /**
+     * 普通聊天框只提交 question，用户在正文写出的完整项目 key 也应成为检索默认范围。
+     * 精确边界避免把 sample-search 误认成 sample-searching；显式表单选择优先。
+     */
+    void prepareExplicitProjectContext(AskContext c) {
+        if (c == null || (c.getSpecifiedProjects() != null && !c.getSpecifiedProjects().isEmpty())) return;
+        List<String> mentioned = mentionedProjects(c.getQuestion(), loader.getProjects());
+        if (!mentioned.isEmpty()) {
+            c.setSpecifiedProjects(mentioned);
+            c.setProjectScopeInferred(true);
+            log.info("从问题文本识别指定项目: {}", mentioned);
+        }
+    }
+
+    static List<String> mentionedProjects(String question, List<ProjectInfo> projects) {
+        if (question == null || question.isBlank() || projects == null) return List.of();
+        List<String> mentioned = new ArrayList<>();
+        for (ProjectInfo project : projects) {
+            if (project == null || project.getName() == null || project.getName().isBlank()) continue;
+            Pattern exactKey = Pattern.compile("(?<![A-Za-z0-9_-])"
+                    + Pattern.quote(project.getName()) + "(?![A-Za-z0-9_-])", Pattern.CASE_INSENSITIVE);
+            if (exactKey.matcher(question).find()) mentioned.add(project.getName());
+        }
+        return mentioned;
+    }
+
+    /**
+     * 普通聊天框里直接输入“/path 这个接口的逻辑是什么”时，补齐接口分析字段并确定入口项目。
+     * 这样不要求用户必须展开高级表单，也不会先让自由 Agent 扫完整个 44 项目代码区。
+     */
+    void prepareInterfaceAnalysisContext(AskContext c) {
+        if (c == null || !c.isInterfaceLogicQuestion()) return;
+        String path = c.detectedApiPath();
+        if (path == null || path.isBlank()) return;
+        if (c.getApiPath() == null || c.getApiPath().isBlank()) c.setApiPath(path);
+        if (c.getSpecifiedProjects() != null && !c.getSpecifiedProjects().isEmpty()) return;
+
+        try {
+            SearchResult best = selectEntryCandidate(searcher.search(loader.getProjects(), List.of(path)));
+            if (best != null && (best.isPathHit() || best.getPathScore() >= 60)) {
+                c.setSpecifiedProjects(List.of(best.getProjectName()));
+                c.setEntryFile(toRelative(best.getFilePath()));
+                log.info("接口逻辑题自动定位入口: path={}, project={}, file={}, score={}",
+                        path, best.getProjectName(), best.getFilePath(), best.getPathScore());
+            }
+        } catch (Exception e) {
+            log.warn("接口逻辑题自动定位入口失败，保留状态图全局检索: path={}, reason={}", path, e.getMessage());
+        }
+    }
+
+    /**
+     * 从全仓命中中选择 HTTP 入口定义。Controller 是服务端入口；Feign/Client 即使带有
+     * RequestMapping 也只是调用方，不能用来限定后续追踪项目。
+     */
+    static SearchResult selectEntryCandidate(List<SearchResult> hits) {
+        if (hits == null || hits.isEmpty()) return null;
+        List<SearchResult> controllers = hits.stream()
+                .filter(ProductAgent::isControllerSource)
+                .toList();
+        List<SearchResult> candidates = controllers.isEmpty()
+                ? hits.stream()
+                        .filter(hit -> hit.getRouteAnnotationCount() > 0)
+                        .filter(hit -> !isClientSource(hit))
+                        .toList()
+                : controllers;
+        return candidates.stream()
+                .max(java.util.Comparator.comparingInt(ProductAgent::entryCandidateScore))
+                .orElse(null);
+    }
+
+    private static boolean isControllerSource(SearchResult hit) {
+        String path = hit.getFilePath() == null ? "" : hit.getFilePath().replace('\\', '/').toLowerCase();
+        return path.endsWith("controller.java") || path.contains("/controller/");
+    }
+
+    private static boolean isClientSource(SearchResult hit) {
+        String path = hit.getFilePath() == null ? "" : hit.getFilePath().replace('\\', '/').toLowerCase();
+        return path.contains("/feign/") || path.endsWith("client.java") || path.endsWith("rpcclient.java");
+    }
+
+    private static int entryCandidateScore(SearchResult hit) {
+        return (hit.isPathHit() ? 10_000 : 0)
+                + hit.getPathScore() * 10
+                + hit.getRouteAnnotationCount();
     }
 
     /** 切分正文和末尾置信度标记 */

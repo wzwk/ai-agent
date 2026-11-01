@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import dev.example.productai.agent.trace.TraceCompletenessGate;
+import dev.example.productai.agent.trace.TraceContinuationPolicy;
 import dev.example.productai.agent.trace.TraceEdge;
 import dev.example.productai.agent.trace.TraceEvidenceExtractor;
 import dev.example.productai.agent.trace.TraceState;
@@ -48,18 +49,17 @@ import java.util.regex.Pattern;
 @RequiredArgsConstructor
 public class TraceGraphExecutor {
 
-    private static final Set<String> CONTINUATION_WORDS = Set.of(
-            "继续", "接着", "继续深挖", "继续查", "往下查", "没闭环", "查到底");
     private static final Pattern STORED_SOURCE_MATERIAL = Pattern.compile(
             "^【(?:read_file|search_in_file)\\s+([^\\s】]+).*?】\\R([\\s\\S]*)$");
 
     private final LlmClient llm;
-    private final AgentExecutor toolRuntime;
+    private final AgentToolRuntime toolRuntime;
     private final AgentProperties agentProperties;
     private final TraceCheckpointRepository checkpoints;
     private final TraceCompletenessGate completenessGate;
     private final TraceStuckDetector stuckDetector;
     private final TraceEvidenceExtractor evidenceExtractor;
+    private final TraceContinuationPolicy continuationPolicy;
     private final JavaSymbolIndex symbolIndex;
     private final ObjectMapper mapper;
 
@@ -76,23 +76,20 @@ public class TraceGraphExecutor {
                                 String mode,
                                 Integer freeRemaining,
                                 long startedAt,
-                                AgentExecutor.StreamHooks hooks) {
+                                AgentStreamHooks hooks) {
         String question = context.getQuestion();
-        boolean resumeRequested = isContinuation(question);
-        TraceState state = resumeRequested ? checkpoints.loadLatestResumable(session.getSessionId()) : null;
+        TraceState candidate = continuationPolicy.hasContinuationIntent(question)
+                ? checkpoints.loadLatestResumable(session.getSessionId()) : null;
+        TraceState state = continuationPolicy.shouldResume(question, candidate) ? candidate : null;
         boolean resumed = state != null;
         if (state == null) {
             state = TraceState.start(session.getSessionId(), question, mode, context.getSpecifiedProjects());
         } else {
-            state.normalize();
-            state.setLatestQuestion(question);
-            state.setStatus(TraceStatus.RUNNING);
-            state.setFinishRequested(false);
-            if (context.getSpecifiedProjects() != null) state.getTargetProjects().addAll(context.getSpecifiedProjects());
+            prepareForResume(state, question, context.getSpecifiedProjects());
         }
 
-        AgentExecutor.Harvest harvest = restoreHarvest(state, context);
-        if (resumed) replayStoredEvidence(state, harvest);
+        AgentHarvest harvest = restoreHarvest(state, context);
+        if (resumed) reconcileClosureFromReadEvidence(state, harvest);
         Map<String, Boolean> availability = toolRuntime.computeAvailability();
         Map<String, Integer> failStreak = new HashMap<>();
         List<ChatResponse.Step> steps = new ArrayList<>();
@@ -116,16 +113,24 @@ public class TraceGraphExecutor {
         boolean elapsedGateHit = false;
         RuntimeMetrics metrics = new RuntimeMetrics();
 
+        String prefetchedEvidence = prefetchExactApiEvidence(context, availability, harvest, failStreak,
+                state, steps, emit, metrics);
+        syncStateFromHarvest(state, harvest);
+
         List<ToolChatMessage> messages = new ArrayList<>();
         String baseSystem = toolRuntime.buildExploreSystemPrompt(
                 mode, availability, plannedBudget, deepTrace, graceTurns);
         messages.add(ToolChatMessage.system(baseSystem + traceControlPrompt()));
-        messages.add(ToolChatMessage.user(buildPlannerInput(state, session, context, resumed)));
+        String plannerInput = buildPlannerInput(state, session, context, resumed);
+        if (!prefetchedEvidence.isBlank()) plannerInput += prefetchedEvidence;
+        messages.add(ToolChatMessage.user(plannerInput));
         List<Map<String, Object>> tools = traceToolSchemas();
 
         checkpoints.save(state, resumed ? "RESUMED" : "STARTED");
 
-        while (localRounds < activeBudget) {
+        // checkpoint 的源码可能已经完整，只是旧版漏清 pending/阻断。恢复时先让确定性
+        // 证据门禁判定；已闭环则直接成文，不再额外消耗一轮模型搜索。
+        while (!completenessGate.evaluate(state).complete() && localRounds < activeBudget) {
             toolRuntime.checkCancelled();
             if (localRounds > 0 && System.currentTimeMillis() - startedAt >= agentProperties.getTraceMaxExploreMs()) {
                 elapsedGateHit = true;
@@ -170,7 +175,7 @@ public class TraceGraphExecutor {
                         + "。不要成文；请从 pending edge 继续查，或用 update_trace 给出有证据的阻断原因。"));
                 stuckDetector.registerRoundProgress(state, progressBefore);
                 checkpoints.save(state, "CLOSURE_REJECTED");
-                if (state.getNoProgressRounds() >= 3) {
+                if (state.getNoProgressRounds() >= agentProperties.getTraceMaxNoProgressRounds()) {
                     state.setIncompleteReason("连续多轮没有新增调用边、文件或终点证据");
                     break;
                 }
@@ -225,6 +230,7 @@ public class TraceGraphExecutor {
             }
             boolean progressed = stuckDetector.registerRoundProgress(state, progressBefore);
             toolRuntime.compressIfNeeded(messages);
+            compactDecisionContext(messages, baseSystem, state, session, context);
             checkpoints.save(state, progressed ? "PROGRESSED" : "NO_PROGRESS");
 
             TraceCompletenessGate.Result gate = completenessGate.evaluate(state);
@@ -256,12 +262,13 @@ public class TraceGraphExecutor {
                         .status("error").elapsedMs(0).build());
                 messages.add(ToolChatMessage.user("你连续两轮没有新增事实。请停止改写相同关键词，"
                         + "优先用 find_symbol 精确定位 pending edge 的目标类型，或换到提供方项目。"));
-                if (state.getNoProgressRounds() >= 3) {
-                    state.setIncompleteReason("连续三轮没有新增调用边、文件或终点证据，已停止无效重复探索");
+                if (state.getNoProgressRounds() >= agentProperties.getTraceMaxNoProgressRounds()) {
+                    state.setIncompleteReason("连续 " + agentProperties.getTraceMaxNoProgressRounds()
+                            + " 轮没有新增调用边、文件或终点证据，已停止无效重复探索");
                     break;
                 }
             }
-            if (usedTokens > agentProperties.getTokenBudget()) {
+            if (usedTokens > agentProperties.getTraceTokenBudget()) {
                 tokenGateHit = true;
                 state.setIncompleteReason("token 预算耗尽（" + usedTokens + "）");
                 break;
@@ -304,10 +311,19 @@ public class TraceGraphExecutor {
         long composeStarted = System.currentTimeMillis();
         Answer answer = composeAnswer(context, session, mode, harvest, state, complete, hooks);
         metrics.composeMs += System.currentTimeMillis() - composeStarted;
+        // “图闭环”与“回答闭环”必须一致。即使状态图没有 pending，成文仍声称某一环节
+        // 未检索到，也不能把本次结果标成 complete，否则用户会看到自相矛盾的状态。
+        if (complete && answerHasGapClaim(answer.text())) {
+            complete = false;
+            state.setStatus(TraceStatus.PARTIAL);
+            state.setIncompleteReason("最终回答仍包含未验证环节，闭环状态已降级");
+            checkpoints.save(state, "ANSWER_GAP_DETECTED");
+        }
         if (!complete) {
             answer = new Answer("⚠️ 本次调用链尚未完全闭环，以下内容区分了已验证事实与待确认分支。\n\n"
                     + answer.text(), "high".equals(answer.confidence()) ? "medium" : answer.confidence());
         }
+        answer = new Answer(context.enforceOutputPreferences(answer.text()), answer.confidence());
 
         session.append(new ChatMessage("user", question));
         session.append(new ChatMessage("assistant", answer.text()));
@@ -318,9 +334,120 @@ public class TraceGraphExecutor {
         return buildResponse(state, harvest, session, mode, freeRemaining, elapsed, answer, steps, complete, metrics);
     }
 
+    /**
+     * 精确接口题的第一步是确定性的：先搜完整路径并批量实读最可信候选，不必先付一轮
+     * LLM 决策延迟。预取只是给状态图增加证据，后续闭环门禁、跨服务追踪和最终模型均不变。
+     */
+    private String prefetchExactApiEvidence(AskContext context,
+                                            Map<String, Boolean> availability,
+                                            AgentHarvest harvest,
+                                            Map<String, Integer> failStreak,
+                                            TraceState state,
+                                            List<ChatResponse.Step> steps,
+                                            java.util.function.Consumer<ChatResponse.Step> emit,
+                                            RuntimeMetrics metrics) {
+        String apiPath = context.detectedApiPath();
+        if (apiPath == null || apiPath.isBlank()) return "";
+
+        List<String> projects = context.getSpecifiedProjects() == null
+                ? List.of() : context.getSpecifiedProjects();
+        ObjectNode searchArgs = mapper.createObjectNode();
+        searchArgs.putArray("keywords").add(apiPath);
+        ArrayNode projectKeys = searchArgs.putArray("project_keys");
+        projects.forEach(projectKeys::add);
+        ToolCall search = new ToolCall("prefetch-api-search", "search_code", searchArgs.toString());
+        LocalToolResult searchResult = executePrefetchTool(search, availability, harvest, failStreak,
+                state, steps, emit, metrics);
+        if (!searchResult.ok()) return "";
+
+        boolean gatewayQuestion = isGatewayQuestion(context.getQuestion());
+        List<Map.Entry<String, SearchResult>> candidates = harvest.codeHits.entrySet().stream()
+                .sorted((left, right) -> Integer.compare(
+                        prefetchScore(right.getValue(), gatewayQuestion),
+                        prefetchScore(left.getValue(), gatewayQuestion)))
+                .limit(gatewayQuestion ? 6 : 4)
+                .toList();
+
+        StringBuilder evidence = new StringBuilder("\n\n程序已完成精确接口预取；以下均为本轮实时工具证据，"
+                + "优先基于这些材料批量登记调用边，不要重复搜索相同接口路径：\n");
+        appendCapped(evidence, searchResult.content(), 8_000);
+        int read = 0;
+        for (Map.Entry<String, SearchResult> candidate : candidates) {
+            String file = candidate.getKey();
+            if (harvest.readFiles.contains(file)) continue;
+            ObjectNode readArgs = mapper.createObjectNode();
+            readArgs.put("file_path", file);
+            ToolCall readCall = new ToolCall("prefetch-api-read-" + (++read), "read_file", readArgs.toString());
+            LocalToolResult readResult = executePrefetchTool(readCall, availability, harvest, failStreak,
+                    state, steps, emit, metrics);
+            if (readResult.ok()) appendCapped(evidence, readResult.content(), 6_000);
+        }
+        evidence.append("\n预取结束。只有证据仍缺失的 pending edge 才需要继续调用搜索工具。\n");
+        log.info("精确接口预取完成 path={}, candidates={}, readFiles={}, gateway={}",
+                apiPath, candidates.size(), read, gatewayQuestion);
+        return evidence.toString();
+    }
+
+    private LocalToolResult executePrefetchTool(ToolCall call,
+                                                Map<String, Boolean> availability,
+                                                AgentHarvest harvest,
+                                                Map<String, Integer> failStreak,
+                                                TraceState state,
+                                                List<ChatResponse.Step> steps,
+                                                java.util.function.Consumer<ChatResponse.Step> emit,
+                                                RuntimeMetrics metrics) {
+        long started = System.currentTimeMillis();
+        LocalToolResult result;
+        String signature = canonicalSignature(call);
+        if (!stuckDetector.registerTool(state, signature)) {
+            result = new LocalToolResult(false,
+                    "{\"error\":\"DUPLICATE_TOOL_CALL\",\"detail\":\"预取工具已执行\"}",
+                    "跳过重复预取");
+        } else {
+            result = execute(call, availability, harvest, failStreak, state);
+        }
+        collectDeterministicEvidence(call, result, state);
+        long elapsed = System.currentTimeMillis() - started;
+        metrics.toolCalls++;
+        metrics.toolMs += elapsed;
+        addStep(steps, emit, ChatResponse.Step.builder()
+                .no(state.getDecisionRounds()).phase("prefetch")
+                .tool(call.name()).args(pretty(call.arguments())).summary(result.summary())
+                .status(result.ok() ? "ok" : "error").elapsedMs(elapsed).build());
+        return result;
+    }
+
+    private static int prefetchScore(SearchResult result, boolean gatewayQuestion) {
+        int score = 0;
+        if (result.isPathHit()) score += 1_000;
+        if (result.isPartialPathHit()) score += 500;
+        score += Math.min(5, result.getRouteAnnotationCount()) * 80;
+        score += Math.min(20, result.getHitCount());
+        String project = result.getProjectName() == null ? "" : result.getProjectName().toLowerCase(Locale.ROOT);
+        if (gatewayQuestion && (project.contains("apisix") || project.contains("gateway"))) score += 2_000;
+        return score;
+    }
+
+    private static boolean isGatewayQuestion(String question) {
+        if (question == null) return false;
+        String normalized = question.toLowerCase(Locale.ROOT);
+        return normalized.contains("apisix") || normalized.contains("网关")
+                || normalized.contains("转发") || normalized.contains("路由")
+                || normalized.contains("upstream");
+    }
+
+    private static void appendCapped(StringBuilder out, String value, int maxChars) {
+        if (value == null || value.isBlank()) return;
+        int room = Math.max(0, 32_000 - out.length());
+        if (room == 0) return;
+        int take = Math.min(Math.min(maxChars, value.length()), room);
+        out.append(value, 0, take).append('\n');
+        if (take < value.length()) out.append("...(预取材料截断)\n");
+    }
+
     private LocalToolResult execute(ToolCall call,
                                     Map<String, Boolean> availability,
-                                    AgentExecutor.Harvest harvest,
+                                    AgentHarvest harvest,
                                     Map<String, Integer> failStreak,
                                     TraceState state) {
         try {
@@ -333,7 +460,7 @@ public class TraceGraphExecutor {
                 case "finish_trace" -> requestFinish(state);
                 case "search_code" -> smartSearch(normalizedCall, args, availability, harvest, failStreak);
                 default -> {
-                    AgentExecutor.ExecResult legacy = toolRuntime.executeTool(normalizedCall, availability, harvest, failStreak);
+                    ToolExecResult legacy = toolRuntime.executeTool(normalizedCall, availability, harvest, failStreak);
                     yield new LocalToolResult(legacy.ok(), legacy.content(), legacy.summary());
                 }
             };
@@ -365,7 +492,7 @@ public class TraceGraphExecutor {
     private LocalToolResult smartSearch(ToolCall call,
                                         JsonNode args,
                                         Map<String, Boolean> availability,
-                                        AgentExecutor.Harvest harvest,
+                                        AgentHarvest harvest,
                                         Map<String, Integer> failStreak) {
         List<String> projects = new ArrayList<>();
         args.path("project_keys").forEach(n -> projects.add(n.asText()));
@@ -382,7 +509,7 @@ public class TraceGraphExecutor {
                         "符号索引替代全库搜索；" + exact.summary());
             }
         }
-        AgentExecutor.ExecResult legacy = toolRuntime.executeTool(call, availability, harvest, failStreak);
+        ToolExecResult legacy = toolRuntime.executeTool(call, availability, harvest, failStreak);
         return new LocalToolResult(legacy.ok(), legacy.content(), legacy.summary());
     }
 
@@ -392,7 +519,7 @@ public class TraceGraphExecutor {
      */
     private int autoExpandEvidence(List<ToolChatMessage> messages,
                                    Map<String, Boolean> availability,
-                                   AgentExecutor.Harvest harvest,
+                                   AgentHarvest harvest,
                                    Map<String, Integer> failStreak,
                                    TraceState state,
                                    List<ChatResponse.Step> steps,
@@ -484,10 +611,17 @@ public class TraceGraphExecutor {
      */
     private void commitLatestEvidence(AskContext context,
                                       TraceState state,
-                                      AgentExecutor.Harvest harvest,
+                                      AgentHarvest harvest,
                                       List<ChatResponse.Step> steps,
                                       java.util.function.Consumer<ChatResponse.Step> emit,
                                       RuntimeMetrics metrics) {
+        // pending edge 可能晚于对应 read_file 才被模型登记。若只在“读取当下”做确定性
+        // 提取，这些已有证据会被遗漏，最后被迫再调用一次 LLM 收尾。提交前重放全部
+        // 已读源码，让证据顺序不影响闭环结果；若程序门禁已经满足则直接完成。
+        if (reconcileClosureFromReadEvidence(state, harvest)) {
+            checkpoints.save(state, "DETERMINISTIC_EVIDENCE_COMMITTED");
+            return;
+        }
         TraceCompletenessGate.Result before = completenessGate.evaluate(state);
         if (before.complete() || harvest.materials.isEmpty()) return;
         try {
@@ -499,8 +633,8 @@ public class TraceGraphExecutor {
                             3) 没有证据的边保持 pending；
                             4) 调用 update_trace；若确实没有 pending 和阻断，再同时调用 finish_trace。
                             """),
-                    ToolChatMessage.user(stateSummary(state) + "\n\n最近材料：\n"
-                            + recentMaterials(harvest, agentProperties.getTraceCommitContextBytes())));
+                    ToolChatMessage.user(closureStateSummary(state) + "\n\n待查边相关材料：\n"
+                            + closureMaterials(harvest, state, agentProperties.getTraceCommitContextBytes())));
             long decisionStarted = System.currentTimeMillis();
             metrics.decisionCalls++;
             ToolChatResult result;
@@ -533,7 +667,144 @@ public class TraceGraphExecutor {
         }
     }
 
-    private String recentMaterials(AgentExecutor.Harvest harvest, int cap) {
+    boolean reconcileClosureFromReadEvidence(TraceState state, AgentHarvest harvest) {
+        replayStoredEvidence(state, harvest);
+        clearSatisfiedUnresolvedReasons(state, harvest);
+        if (state.pendingEdgeCount() == 0 && !state.getTerminals().isEmpty()
+                && state.getUnresolvedReasons().isEmpty()) {
+            state.setFinishRequested(true);
+        }
+        return completenessGate.evaluate(state).complete();
+    }
+
+    /**
+     * 模型可能先登记“某实现未读”，随后已经实读该类却忘记清理旧阻断。
+     * 这里只清理由“未读/未展开”产生、且文本明确点名了已读 Java 类型的陈旧原因；
+     * 动态配置、反射、源码真实缺失等没有已读类型佐证的阻断会继续保留。
+     */
+    int clearSatisfiedUnresolvedReasons(TraceState state, AgentHarvest harvest) {
+        LinkedHashSet<String> readTypes = new LinkedHashSet<>();
+        for (String file : harvest.readFiles) addReadType(readTypes, file);
+        for (String material : harvest.materials) {
+            if (material == null) continue;
+            Matcher matcher = STORED_SOURCE_MATERIAL.matcher(material);
+            if (matcher.matches()) addReadType(readTypes, normalizedFile(matcher.group(1)));
+        }
+        int before = state.getUnresolvedReasons().size();
+        state.getUnresolvedReasons().removeIf(reason -> staleUnreadReason(reason, readTypes));
+        int cleared = before - state.getUnresolvedReasons().size();
+        if (cleared > 0) log.info("清理已被实读源码满足的陈旧阻断项：{}", cleared);
+        return cleared;
+    }
+
+    private void addReadType(Set<String> readTypes, String file) {
+        if (file == null || file.isBlank()) return;
+        String normalized = file.replace('\\', '/');
+        String name = normalized.substring(normalized.lastIndexOf('/') + 1);
+        if (name.endsWith(".java")) name = name.substring(0, name.length() - 5);
+        if (!name.isBlank()) readTypes.add(name.toLowerCase(Locale.ROOT));
+    }
+
+    private boolean staleUnreadReason(String reason, Set<String> readTypes) {
+        if (reason == null || reason.isBlank()) return false;
+        boolean unreadClaim = reason.contains("未读") || reason.contains("未在材料")
+                || reason.contains("未展开") || reason.contains("尚未读取") || reason.contains("没有读取");
+        if (!unreadClaim) return false;
+        Matcher token = Pattern.compile("[A-Za-z_$][A-Za-z0-9_$]*").matcher(reason);
+        while (token.find()) {
+            String mentioned = token.group().toLowerCase(Locale.ROOT);
+            if (mentioned.length() < 6) continue;
+            for (String readType : readTypes) {
+                if (readType.equals(mentioned) || readType.equals(mentioned + "impl")
+                        || readType.startsWith(mentioned) || mentioned.startsWith(readType)) return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * 决策模型只需要当前结构化状态和最近几组工具交互。完整源码材料仍保留在 harvest，
+     * 最终成文继续使用完整材料窗口，因此这里缩短的是重复决策上下文，不是删除证据。
+     */
+    void compactDecisionContext(List<ToolChatMessage> messages,
+                                String baseSystem,
+                                TraceState state,
+                                ConversationSession session,
+                                AskContext context) {
+        int cap = Math.max(16_000, agentProperties.getTraceDecisionContextBytes());
+        int total = messages.stream().mapToInt(this::messageSize).sum();
+        if (total <= cap || messages.size() <= 4) return;
+
+        String refreshedPlanner = buildPlannerInput(state, session, context, true);
+        int tailBudget = Math.max(8_000, cap - baseSystem.length() - refreshedPlanner.length());
+        int used = 0;
+        int start = messages.size();
+        for (int i = messages.size() - 1; i >= 2; i--) {
+            int size = messageSize(messages.get(i));
+            if (used + size > tailBudget && start < messages.size()) break;
+            used += size;
+            start = i;
+        }
+        while (start < messages.size() && !"assistant".equals(messages.get(start).getRole())) start++;
+        List<ToolChatMessage> tail = start < messages.size()
+                ? new ArrayList<>(messages.subList(start, messages.size())) : List.of();
+        messages.clear();
+        messages.add(ToolChatMessage.system(baseSystem + traceControlPrompt()));
+        messages.add(ToolChatMessage.user(refreshedPlanner));
+        messages.addAll(tail);
+    }
+
+    private int messageSize(ToolChatMessage message) {
+        int size = message.getContent() == null ? 0 : message.getContent().length();
+        if (message.getToolCalls() != null) {
+            for (ToolCall call : message.getToolCalls()) {
+                size += (call.name() == null ? 0 : call.name().length())
+                        + (call.arguments() == null ? 0 : call.arguments().length());
+            }
+        }
+        return size;
+    }
+
+    private String closureStateSummary(TraceState state) {
+        StringBuilder out = new StringBuilder("traceId=").append(state.getTraceId())
+                .append("；待查边=").append(state.pendingEdgeCount())
+                .append("；已确认终点=").append(state.getTerminals().size()).append('\n');
+        state.getEdges().values().stream().filter(TraceEdge::isPending).forEach(edge -> out.append("- [pending] ")
+                .append(edge.getFromSymbol()).append(" -> ").append(edge.getToSymbol())
+                .append(edge.getEvidenceFile() == null ? "" : " @ " + edge.getEvidenceFile()
+                        + (edge.getEvidenceLine() == null ? "" : ":" + edge.getEvidenceLine()))
+                .append('\n'));
+        if (!state.getUnresolvedReasons().isEmpty()) {
+            out.append("阻断项：\n");
+            state.getUnresolvedReasons().forEach(reason -> out.append("- ").append(reason).append('\n'));
+        }
+        return out.toString();
+    }
+
+    private String closureMaterials(AgentHarvest harvest, TraceState state, int cap) {
+        List<String> materials = toolRuntime.distillMaterials(harvest);
+        LinkedHashSet<String> needles = new LinkedHashSet<>();
+        state.getEdges().values().stream().filter(TraceEdge::isPending).forEach(edge -> {
+            for (String token : (edge.getFromSymbol() + " " + edge.getToSymbol()).split("[^A-Za-z0-9_$]+")) {
+                if (token.length() >= 4) needles.add(token.toLowerCase(Locale.ROOT));
+            }
+        });
+        List<String> ranked = materials.stream()
+                .sorted(java.util.Comparator.comparingInt((String material) -> {
+                    String lower = material.toLowerCase(Locale.ROOT);
+                    return (int) needles.stream().filter(lower::contains).count();
+                }).reversed())
+                .toList();
+        StringBuilder out = new StringBuilder();
+        for (String material : ranked) {
+            if (out.length() + material.length() > cap) continue;
+            out.append(material).append('\n');
+            if (out.length() >= cap * 9 / 10) break;
+        }
+        return out.toString();
+    }
+
+    private String recentMaterials(AgentHarvest harvest, int cap) {
         List<String> materials = toolRuntime.distillMaterials(harvest);
         StringBuilder out = new StringBuilder();
         for (int i = materials.size() - 1; i >= 0; i--) {
@@ -544,11 +815,15 @@ public class TraceGraphExecutor {
         return out.toString();
     }
 
-    private LocalToolResult findSymbol(JsonNode args, AgentExecutor.Harvest harvest) {
+    private LocalToolResult findSymbol(JsonNode args, AgentHarvest harvest) {
         String symbol = args.path("symbol").asText("").trim();
         List<String> projects = new ArrayList<>();
-        args.path("project_keys").forEach(n -> projects.add(n.asText()));
+        args.path("project_keys").forEach(n -> {
+            String key = n.asText("").trim();
+            if (!key.isEmpty()) projects.add(key);
+        });
         if (symbol.isBlank()) return error("INVALID_ARGS", "symbol 不能为空");
+        AgentExecutor.applyDefaultProjectScope(projects, harvest);
         List<JavaSymbolIndex.Hit> hits = symbolIndex.find(symbol, projects);
         ObjectNode root = mapper.createObjectNode();
         ArrayNode results = root.putArray("results");
@@ -565,9 +840,9 @@ public class TraceGraphExecutor {
         return new LocalToolResult(true, content, "精确定位 " + hits.size() + " 个候选文件");
     }
 
-    private LocalToolResult updateTrace(JsonNode args,
-                                        AgentExecutor.Harvest harvest,
-                                        TraceState state) {
+    LocalToolResult updateTrace(JsonNode args,
+                                AgentHarvest harvest,
+                                TraceState state) {
         int acceptedEdges = 0;
         int acceptedTerminals = 0;
         List<String> warnings = new ArrayList<>();
@@ -650,15 +925,16 @@ public class TraceGraphExecutor {
     private Answer composeAnswer(AskContext context,
                                  ConversationSession session,
                                  String mode,
-                                 AgentExecutor.Harvest harvest,
+                                 AgentHarvest harvest,
                                  TraceState state,
                                  boolean complete,
-                                 AgentExecutor.StreamHooks hooks) {
+                                 AgentStreamHooks hooks) {
         if (harvest.materials.isEmpty()) {
             return new Answer("没有在本地代码库中获得足够材料。" + state.getIncompleteReason(), "low");
         }
         String system = toolRuntime.buildFinalSystemPrompt(
-                mode, new ArrayList<>(state.getSearchedProjects()), context.useFlowchart());
+                mode, new ArrayList<>(state.getSearchedProjects()),
+                context.useFlowchart(), context.usesBriefAnswer());
         String user = buildFinalInput(context.getQuestion(), session, harvest, state, complete);
         try {
             String raw = hooks != null && hooks.onDelta() != null
@@ -673,7 +949,7 @@ public class TraceGraphExecutor {
     }
 
     private ChatResponse buildResponse(TraceState state,
-                                       AgentExecutor.Harvest harvest,
+                                       AgentHarvest harvest,
                                        ConversationSession session,
                                        String mode,
                                        Integer freeRemaining,
@@ -719,8 +995,8 @@ public class TraceGraphExecutor {
                 .build();
     }
 
-    private AgentExecutor.Harvest restoreHarvest(TraceState state, AskContext context) {
-        AgentExecutor.Harvest harvest = new AgentExecutor.Harvest();
+    private AgentHarvest restoreHarvest(TraceState state, AskContext context) {
+        AgentHarvest harvest = new AgentHarvest();
         harvest.searchedProjects.addAll(state.getSearchedProjects());
         harvest.readFiles.addAll(state.getReadFiles());
         harvest.materials.addAll(state.getMaterials());
@@ -733,7 +1009,7 @@ public class TraceGraphExecutor {
      * 旧 checkpoint 中的材料是在确定性证据提取器上线前保存的。恢复任务时重放这些已读源码，
      * 这样续查可以直接继承已经确认的数据终点，不必浪费轮次重复读取同一批文件。
      */
-    private void replayStoredEvidence(TraceState state, AgentExecutor.Harvest harvest) {
+    void replayStoredEvidence(TraceState state, AgentHarvest harvest) {
         int resolvedEdges = 0;
         int terminals = 0;
         for (String material : harvest.materials) {
@@ -746,11 +1022,22 @@ public class TraceGraphExecutor {
             terminals += extraction.terminals();
         }
         if (resolvedEdges > 0 || terminals > 0) {
-            log.info("恢复 checkpoint 时重放源码证据：resolvedEdges={}, terminals={}", resolvedEdges, terminals);
+            log.info("重放已读源码证据：resolvedEdges={}, terminals={}", resolvedEdges, terminals);
         }
     }
 
-    private void syncStateFromHarvest(TraceState state, AgentExecutor.Harvest harvest) {
+    void prepareForResume(TraceState state, String question, List<String> specifiedProjects) {
+        state.normalize();
+        state.setLatestQuestion(question);
+        state.setStatus(TraceStatus.RUNNING);
+        state.setFinishRequested(false);
+        // noProgressRounds 只描述上一次执行片段。用户主动续查后应获得完整的重新规划预算。
+        state.setNoProgressRounds(0);
+        state.setIncompleteReason(null);
+        if (specifiedProjects != null) state.getTargetProjects().addAll(specifiedProjects);
+    }
+
+    private void syncStateFromHarvest(TraceState state, AgentHarvest harvest) {
         state.getSearchedProjects().addAll(harvest.searchedProjects);
         state.getReadFiles().addAll(harvest.readFiles);
         state.setMaterials(new ArrayList<>(harvest.materials));
@@ -760,9 +1047,14 @@ public class TraceGraphExecutor {
                                      ConversationSession session,
                                      AskContext context,
                                      boolean resumed) {
+        String entryScope = context.getEntryFile() == null || context.getEntryFile().isBlank()
+                ? "入口文件未预定位：先精确定位用户所指的服务端 Controller。"
+                : "唯一调查根节点文件：" + context.getEntryFile() + "。只追踪从该入口实际可达的调用分支；"
+                  + "其他 Controller 中碰巧存在同名/相似 URL 的接口不属于本次链路，不要展开，可直接忽略。";
         return """
                 用户本轮问题：%s
                 原始调查目标：%s
+                %s
                 %s
 
                 当前状态图：
@@ -775,16 +1067,16 @@ public class TraceGraphExecutor {
                 每次从源码确认新调用边或数据终点后，必须调用 update_trace 登记证据。
                 """.formatted(context.getQuestion(), state.getOriginalQuestion(),
                 resumed ? "这是续查任务，不得重复已经执行过的工具和已读文件。" : "这是新调查任务。",
-                stateSummary(state), toolRuntime.renderHistory(session));
+                entryScope, stateSummary(state), toolRuntime.renderHistory(session));
     }
 
     private String buildFinalInput(String question,
                                    ConversationSession session,
-                                   AgentExecutor.Harvest harvest,
+                                   AgentHarvest harvest,
                                    TraceState state,
                                    boolean complete) {
-        StringBuilder materials = new StringBuilder();
-        materials.append(recentMaterials(harvest, agentProperties.getTraceFinalContextBytes()));
+        String materials = finalMaterials(harvest, state, question,
+                agentProperties.getTraceFinalContextBytes());
         return """
                 用户问题：%s
 
@@ -799,10 +1091,68 @@ public class TraceGraphExecutor {
 
                 只允许根据材料和状态图回答。状态为 PARTIAL 时必须逐项列出未闭环分支，
                 不得把接口、Feign、抽象 Service 当成数据终点。
+                状态为 COMPLETE 时，表示程序已验证所有已登记分支：只陈述已验证事实，
+                不得再写“未检索到/未查到/尚未确认/待确认/未闭环”等缺口表述；
+                非回答主线所必需、且材料没有展开的实现细节直接省略，不要主动制造新缺口。
                 回答优先给结论和主链路，合并同类数据终点，控制在 2500 个中文字符以内；
                 不要逐条复述重复的 Repository/Mapper 调用。
                 """.formatted(question, toolRuntime.renderHistory(session),
                 complete ? "COMPLETE" : "PARTIAL", stateSummary(state), materials);
+    }
+
+    /**
+     * 成文材料不能只取“最后读到的文件”。深链路调查中，最近材料通常是最末端实现，
+     * 会把 Controller 和主业务类挤出上下文，导致模型明明读过源码却回答“未检索到”。
+     * 这里按状态图证据出现顺序优先放入主链路文件，再用最近材料补足预算。
+     */
+    String finalMaterials(AgentHarvest harvest, TraceState state, String question, int cap) {
+        List<String> all = toolRuntime.distillMaterials(harvest);
+        if (all.isEmpty() || cap <= 0) return "";
+        LinkedHashSet<String> evidenceFiles = new LinkedHashSet<>();
+        state.getEdges().values().forEach(edge -> {
+            if (edge.getEvidenceFile() != null && !edge.getEvidenceFile().isBlank()) {
+                evidenceFiles.add(edge.getEvidenceFile());
+            }
+        });
+        state.getTerminals().values().forEach(terminal -> {
+            if (terminal.getEvidenceFile() != null && !terminal.getEvidenceFile().isBlank()) {
+                evidenceFiles.add(terminal.getEvidenceFile());
+            }
+        });
+        evidenceFiles.addAll(state.getReadFiles());
+
+        List<String> ordered = new ArrayList<>();
+        LinkedHashSet<String> selected = new LinkedHashSet<>();
+        for (String file : evidenceFiles) {
+            String normalized = file.replace('\\', '/');
+            String base = normalized.substring(normalized.lastIndexOf('/') + 1);
+            all.stream().filter(material -> material.contains(normalized) || material.contains(base))
+                    .forEach(material -> {
+                        if (selected.add(material)) ordered.add(material);
+                    });
+        }
+        for (int i = all.size() - 1; i >= 0; i--) {
+            String material = all.get(i);
+            if (selected.add(material)) ordered.add(material);
+        }
+
+        int perBlock = Math.max(2_500, Math.min(6_000, cap / 12));
+        StringBuilder out = new StringBuilder();
+        for (String material : ordered) {
+            String block = material.length() <= perBlock ? material
+                    : material.substring(0, perBlock) + "\n...(成文材料单块限量截断)";
+            if (out.length() + block.length() + 1 > cap) continue;
+            out.append(block).append('\n');
+            if (out.length() >= cap * 9 / 10) break;
+        }
+        return out.toString();
+    }
+
+    static boolean answerHasGapClaim(String answer) {
+        if (answer == null || answer.isBlank()) return false;
+        return java.util.regex.Pattern.compile(
+                "未检索到|未查到|尚未确认|待确认|未闭环|没有获得足够材料|材料不足")
+                .matcher(answer).find();
     }
 
     private String stateSummary(TraceState state) {
@@ -845,6 +1195,8 @@ public class TraceGraphExecutor {
                 - DB/Mongo/ES/Redis/MQ/文件存储/明确外部系统才可登记 terminals。
                 - resolved 边和 terminal 的 evidence_file 必须是本次或 checkpoint 中实际 read_file/search_in_file 读过的文件。
                 - 发现多分支时全部登记为 pending，逐条处理，不能只查主分支后口头声称完整。
+                - 若规划输入给出了“唯一调查根节点文件”，只追踪从该文件入口实际可达的分支；
+                  全库中其他同名 URL、其他 Controller 的独立入口不属于本次问题，禁止旁路扩展。
                 - 源码缺失、动态配置或反射确实无法确认时，用 unresolved_reasons 写清具体阻断，不能猜测。
                 - unresolved_reasons 只登记仍未闭环、会导致 PARTIAL 的真实阻断；若已经登记为 external terminal，
                   或文字本身是“已闭环”的证明，不要再放入 unresolved_reasons。
@@ -916,12 +1268,6 @@ public class TraceGraphExecutor {
         if (emit != null) emit.accept(step);
     }
 
-    private boolean isContinuation(String question) {
-        if (question == null) return false;
-        String normalized = question.toLowerCase(Locale.ROOT);
-        return CONTINUATION_WORDS.stream().anyMatch(normalized::contains);
-    }
-
     private String canonicalSignature(ToolCall call) {
         try {
             JsonNode args = mapper.readTree(call.arguments() == null ? "{}" : call.arguments());
@@ -983,6 +1329,6 @@ public class TraceGraphExecutor {
         return current.getMessage() == null ? current.getClass().getSimpleName() : current.getMessage();
     }
 
-    private record LocalToolResult(boolean ok, String content, String summary) {}
+    record LocalToolResult(boolean ok, String content, String summary) {}
     private record Answer(String text, String confidence) {}
 }

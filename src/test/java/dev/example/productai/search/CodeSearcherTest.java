@@ -98,6 +98,37 @@ class CodeSearcherTest {
                 searcher.readLines(trailingNewline));
     }
 
+    @Test
+    void searchesApisixLuaPlugins() throws Exception {
+        write("gateway", "header-token-interceptor.lua",
+                "local plugin_name = 'header-token-interceptor'\nfunction _M.access(conf, ctx) end\n");
+        searcher = newSearcher(1, 10, 16);
+        ProjectInfo gateway = ProjectInfo.builder().name("gateway").path("gateway").build();
+
+        List<SearchResult> hits = searcher.search(List.of(gateway), List.of("header-token-interceptor"));
+
+        assertEquals(1, hits.size());
+        assertTrue(hits.get(0).getFilePath().endsWith("header-token-interceptor.lua"));
+    }
+
+    @Test
+    void searchesApisixJsonAndNginxRouteArtifacts() throws Exception {
+        write("sample-apisix-gateway", "decode.json",
+                "{\"/api/v1/items/batch/delete\": {\"type\": 3}}\n");
+        write("sample-apisix-gateway", "vhostlocation.conf",
+                "location ~ ^/api { set $backend 'upstream-backend'; }\n");
+        searcher = newSearcher(1, 20, 16);
+        ProjectInfo gateway = ProjectInfo.builder()
+                .name("sample-apisix-gateway").path("sample-apisix-gateway").build();
+
+        List<SearchResult> hits = searcher.search(List.of(gateway),
+                List.of("/api/v1/items/batch/delete"));
+
+        assertTrue(hits.stream().anyMatch(h -> h.getFilePath().endsWith("decode.json") && h.isPathHit()));
+        assertTrue(hits.stream().anyMatch(h -> h.getFilePath().endsWith("vhostlocation.conf")),
+                "完整路径应派生 /api 顶层前缀并命中网关转发规则");
+    }
+
     private CodeSearcher newSearcher(int parallelism, int maxEntries, int maxMb) {
         SearchProperties search = new SearchProperties();
         search.setParallelism(parallelism);

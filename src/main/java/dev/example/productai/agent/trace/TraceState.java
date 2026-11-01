@@ -76,6 +76,13 @@ public class TraceState {
         if (executedToolSignatures == null) executedToolSignatures = new LinkedHashSet<>();
         if (materials == null) materials = new ArrayList<>();
         if (edges == null) edges = new LinkedHashMap<>();
+        else {
+            // 旧 checkpoint 可能保存了仅 kind 不同的同端点重复边。重新经过 putEdge
+            // 归一化，使 resolved/excluded 证据可以覆盖同节点的陈旧 pending。
+            List<TraceEdge> storedEdges = new ArrayList<>(edges.values());
+            edges = new LinkedHashMap<>();
+            storedEdges.forEach(this::putEdge);
+        }
         if (terminals == null) terminals = new LinkedHashMap<>();
         if (unresolvedReasons == null) unresolvedReasons = new ArrayList<>();
         if (status == null) status = TraceStatus.RUNNING;
@@ -87,7 +94,31 @@ public class TraceState {
 
     public void putEdge(TraceEdge edge) {
         if (edge == null || edge.getToSymbol() == null || edge.getToSymbol().isBlank()) return;
+        // 同一条调用关系可能被模型以 rpc/other/mq 等不同 kind 重复登记。
+        // kind 是展示属性，不应让“已验证边 + 同节点 pending 边”同时存在并永久卡住闭环。
+        for (Map.Entry<String, TraceEdge> entry : new ArrayList<>(edges.entrySet())) {
+            TraceEdge existing = entry.getValue();
+            if (!sameEndpoint(existing, edge)) continue;
+            if (!edge.isPending() && existing.isPending()) {
+                edges.remove(entry.getKey());
+                edges.put(edge.identity(), edge);
+            } else if (edge.isPending() && !existing.isPending()) {
+                // 已有更强的 resolved/excluded 证据，忽略后来重复出现的 pending。
+            } else {
+                edges.put(entry.getKey(), edge);
+            }
+            return;
+        }
         edges.put(edge.identity(), edge);
+    }
+
+    private boolean sameEndpoint(TraceEdge left, TraceEdge right) {
+        return normalizeEndpoint(left.getFromSymbol()).equals(normalizeEndpoint(right.getFromSymbol()))
+                && normalizeEndpoint(left.getToSymbol()).equals(normalizeEndpoint(right.getToSymbol()));
+    }
+
+    private String normalizeEndpoint(String value) {
+        return value == null ? "" : value.replaceAll("[^A-Za-z0-9_$]", "").toLowerCase();
     }
 
     public void putTerminal(TraceTerminal terminal) {

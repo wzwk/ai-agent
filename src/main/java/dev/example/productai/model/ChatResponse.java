@@ -24,7 +24,7 @@ public class ChatResponse {
     /** 命中的项目名列表 */
     private List<String> matchedProjects;
 
-    /** 命中的 feature 列表（来自 sample-gateway 等 BFF） */
+    /** 命中的 feature 列表（来自 sample-album-bff 等 BFF） */
     private List<String> matchedFeatures;
 
     /** 引用的源代码文件列表（相对 code-base 的短路径） */

@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
@@ -185,6 +185,10 @@ main{flex:1;display:flex;flex-direction:column;min-width:0}
 /* 引用源码 */
 details.srcs{margin-top:11px;border-top:1px dashed var(--border);padding-top:9px}
 details.srcs summary{cursor:pointer;font-size:12px;color:var(--muted);user-select:none;outline:none}
+.answer-evidence{margin-top:10px;border-top:1px dashed var(--border);padding-top:8px}
+.answer-evidence>summary{cursor:pointer;font-size:12px;color:var(--muted);user-select:none;outline:none}
+.answer-evidence-body{padding-top:6px}
+.business-progress{margin:2px 0 8px;font-size:12px;color:#7c8299}
 .src-row{display:flex;align-items:baseline;gap:8px;padding:5px 0;font-size:12px;flex-wrap:wrap}
 .src-idx{color:#c2c6da;font-size:11px;font-family:Consolas,monospace}
 .src-path{font-family:Consolas,monospace;color:#4a5068;cursor:pointer;word-break:break-all}
@@ -404,7 +408,7 @@ main{position:relative}
       </div>
       <div class="az-row">
         <span class="az-label">接口路径</span>
-        <input id="azPath" placeholder="/api/v3/commodity/multiPriceSkuVersionSave">
+        <input id="azPath" placeholder="/api/v1/items/save">
       </div>
       <div class="az-row" style="flex-direction:column">
         <span class="az-label">我的目标</span>
@@ -531,9 +535,9 @@ main{position:relative}
     <input id="ssDesc" placeholder="什么场景用它、注意什么">
     <div id="sbAnalyzeFields">
       <label>项目（多选，载入后可再调整）</label>
-      <input id="sbProjects" placeholder='项目名，逗号分隔，如 sample-content-service,sample-storage-service'>
+      <input id="sbProjects" placeholder='项目名，逗号分隔，如 sample-operation-service,sample-core-service'>
       <label>接口路径（选填）</label>
-      <input id="sbPath" placeholder="/api/v3/commodity/multiPriceSkuVersionSave">
+      <input id="sbPath" placeholder="/api/v1/items/save">
       <label>分析目标（选填）</label>
       <input id="sbIntent" placeholder="梳理完整保存链路">
       <label style="display:flex;align-items:center;gap:6px;margin-top:12px">
@@ -1180,7 +1184,7 @@ async function send(preset, extra){
   activeReqId=(crypto.randomUUID?crypto.randomUUID():'req-'+Date.now()+'-'+Math.random().toString(36).slice(2));
   // 闭环验收允许长链路持续推进；后端仍有轮数/token/墙钟三道高位保险。
   const requestStartedAt=Date.now();
-  const hardTimeout=setTimeout(()=>{ cancelBackend(); aborter.abort(); },930000);
+  const hardTimeout=setTimeout(()=>{ cancelBackend(); aborter.abort(); },2130000);
   /* SSE 实时流的现场元素：首个事件到达时替换"打字中"占位 */
   let live=null;                       // {wrap, timelineBox, mdBox}
   let steps=[], answerText='', lastMd=0, mdTimer=null;
@@ -1227,7 +1231,15 @@ async function send(preset, extra){
           else if(line.startsWith('data:')) data+=line.slice(5);
         }
         if(!data.trim()) continue;
-        if(ev==='step'){ ensureLive(); steps.push(JSON.parse(data)); live.timelineBox.innerHTML=''; live.timelineBox.append(buildStepsTimeline(steps, null)); ensureLiveStepTicker(); scrollBottom(); }
+        if(ev==='step'){
+          ensureLive(); steps.push(JSON.parse(data)); live.timelineBox.innerHTML='';
+          if(state.mode==='dev'){
+            live.timelineBox.append(buildStepsTimeline(steps, null)); ensureLiveStepTicker();
+          }else{
+            live.timelineBox.innerHTML='<div class="business-progress">正在核对代码和文档，请稍候…</div>';
+          }
+          scrollBottom();
+        }
         else if(ev==='delta'){ ensureLive(); answerText+=JSON.parse(data); renderLiveMd(false); }
         else if(ev==='done'){ full=JSON.parse(data); }
       }
@@ -1254,7 +1266,7 @@ async function send(preset, extra){
     if(live){ live.wrap.remove(); live=null; }
     if(err.name==='AbortError') cancelBackend();
     addError(err.name==='AbortError'
-      ? (manualStop ? '已停止本次回答' : '请求超时（930 秒未完成），请重试；若持续超时请查看后端日志确认 LLM 接口连通性')
+      ? (manualStop ? '已停止本次回答' : '请求超时（35.5 分钟未完成），请重试；若持续超时请查看后端日志确认 LLM 接口连通性')
       : '请求失败：'+err.message+'（请确认服务已启动）');
   }finally{
     clearTimeout(hardTimeout); clearInterval(waitTimer);
@@ -1307,9 +1319,10 @@ function addTyping(){
 async function renderAnswer(data){
   const s=shell('ai');
   const b=document.createElement('div'); b.className='bubble';
+  const businessView=data.mode!=='dev' && data.mode!=='analyze';
 
   /* 智能体探索轨迹时间线（legacy agent / trace 都会返回 steps） */
-  if(data.steps && data.steps.length){
+  if(!businessView && data.steps && data.steps.length){
     b.append(buildStepsTimeline(data.steps, data.stepsUsed));
   }
 
@@ -1338,19 +1351,30 @@ async function renderAnswer(data){
   duration.textContent='⏱ 本次回答完成，耗时 '+fmtMs(Number(data.elapsedMs)||0);
   duration.title='从提交问题到最终回答完成的端到端耗时';
   b.append(duration);
+  let perf=null;
   if(data.performance){
-    const p=data.performance, perf=document.createElement('div'); perf.className='answer-duration';
+    const p=data.performance; perf=document.createElement('div'); perf.className='answer-duration';
     perf.textContent='性能拆分：决策 '+fmtMs(Number(p.decisionMs)||0)+'（'+(p.decisionCalls||0)+' 次） · 工具 '
       +fmtMs(Number(p.toolMs)||0)+'（'+(p.toolCalls||0)+' 次） · 成文 '+fmtMs(Number(p.composeMs)||0)
       +' · 路径 '+(p.route||data.engine||'-');
     perf.title='各阶段为服务端累计耗时；并行或框架开销会使分项之和与总耗时略有差异';
-    b.append(perf);
+    if(!businessView) b.append(perf);
   }
-  b.append(buildMeta(data));
-
-  /* 引用源码 */
+  const meta=buildMeta(data);
   const srcs=buildSources(data);
-  if(srcs) b.append(srcs);
+  if(businessView){
+    const evidence=document.createElement('details'); evidence.className='answer-evidence';
+    const summary=document.createElement('summary'); summary.textContent='查看依据与排查过程';
+    const body=document.createElement('div'); body.className='answer-evidence-body';
+    if(data.steps && data.steps.length) body.append(buildStepsTimeline(data.steps, data.stepsUsed));
+    if(perf) body.append(perf);
+    body.append(meta);
+    if(srcs) body.append(srcs);
+    evidence.append(summary,body); b.append(evidence);
+  }else{
+    b.append(meta);
+    if(srcs) b.append(srcs);
+  }
 
   s.row.append(b); scrollBottom();
 

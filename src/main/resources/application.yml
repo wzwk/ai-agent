@@ -21,10 +21,10 @@ spring:
   mvc:
     async:
       # SSE 流式回答（/api/chat/stream）可能持续数分钟，默认 30s 异步超时会把连接掐断
-      # 后端 trace 最长探索 8 分钟，预留决策尾部和最终成文时间，避免先被 MVC 掐断成空响应。
-      request-timeout: 960000
+      # 后端 trace 最长探索 30 分钟，额外预留最终成文和 SSE 终态时间。
+      request-timeout: 2100000
   # ===== 阶段一持久化（PostgreSQL，PG 未启动时自动降级内存，不影响问答）=====
-  # 示例使用 5433 端口；可通过环境变量或本地私密配置覆盖
+  # 示例数据库端口；可通过环境变量覆盖
   datasource:
     url: jdbc:postgresql://localhost:5433/aitest
     username: aitest
@@ -72,7 +72,7 @@ app:
   share:
     # 每个会话可用共享 Key 免费提问的次数；访客自带 Key 时不占额度。
     # 自己日常使用建议调大（或环境变量 FREE_QUESTIONS=999），对外分享时设为 1
-    free-questions: ${FREE_QUESTIONS:1}
+    free-questions: ${FREE_QUESTIONS:1000}
   # 语义缓存（v0.9 词法版 → v0.12 向量升级：bge-m3 主路 + bigram Jaccard 兜底）
   semantic-cache:
     enabled: true
@@ -107,23 +107,31 @@ app:
     # 默认 hybrid：普通 FAQ/线上处理问题走轻量 Agent；明确深挖、接口分析或指定项目才走状态图。
     # 全量 trace 会把“团队 token 失效怎么处理”这类已有 FAQ 的问题误当调用链任务，浪费时间扫描源码。
     executor: ${AGENT_EXECUTOR:hybrid}
-    # 各模式步数预算（决策轮数；全局硬顶 40 不可突破）
-    mode-budgets: { user: 8, analyze: 10, dev: 12 }
-    # 普通 user 口吻也可以深挖；最后一轮仍发现新线索可追加收尾轮次。
-    deep-trace-budget: 10
-    deep-trace-grace-turns: 2
+    # 闭环优先档：少量用户使用时给复杂问题更充分的探索预算；全局硬顶 80 不可突破。
+    mode-budgets: { user: 16, analyze: 24, dev: 32 }
+    # 深度任务先给 48 轮；若最后一轮仍发现新线索，可再追加 16 轮收尾，合计最多 64 轮。
+    # 不允许无限循环，仍受硬顶、token、墙钟、无进展检测和重复调用检测共同约束。
+    deep-trace-budget: 48
+    deep-trace-grace-turns: 16
     # 单问累计 token 二道闸
-    token-budget: 400000
-    # 状态图会自动批量实读候选并程序化判定闭环；8 分钟足以覆盖复杂链路，
+    token-budget: 1000000
+    # 接口完整链路走状态图；允许更高累计上下文预算，避免尚在新增证据时被普通问答闸门截断。
+    trace-token-budget: 2000000
+    # 状态图会自动批量实读候选并程序化判定闭环；长链路放宽到 30 分钟，
     # 同时确保最终成文能在 Spring/SSE 超时前返回明确 complete/partial 终态。
-    trace-max-explore-ms: 480000
+    trace-max-explore-ms: 1800000
+    # 跨仓库消歧可能连续数轮没有形成新调用边；允许 5 轮重规划后再停止无效探索。
+    trace-max-no-progress-rounds: 5
     # 状态提交/最终成文只携带最近关键材料，完整调用边仍保存在状态图
-    trace-commit-context-bytes: 24000
-    trace-final-context-bytes: 36000
+    trace-commit-context-bytes: 12000
+    trace-decision-context-bytes: 48000
+    trace-final-context-bytes: 64000
     # 只自动读取 pending edge 的精确符号候选；不再把普通 Top 命中整批灌入上下文
     trace-auto-expand-files: 2
+    # 单个工具墙钟上限；执行在可中断虚拟线程中，超时后返回 TOOL_TIMEOUT 让 Agent 换检索策略
+    tool-timeout-ms: 60000
     # 工具结果累计上限（字节），超限压缩最旧工具结果
-    context-cap-bytes: 100000
+    context-cap-bytes: 160000
     # 单个工具结果上限（字节）
     tool-result-cap-bytes: 12000
 
@@ -132,7 +140,7 @@ projects:
   config-location: classpath:projects.yml
   # 本地代码根目录（projects.yml 里的 path 是相对这个根的）
   # Docker 部署时通过 -v 挂载代码目录并用 CODE_BASE 环境变量覆盖
-  code-base: ${CODE_BASE:./sample-code}
+  code-base: ${CODE_BASE:./sample-repositories}
 
 # ===== 代码检索配置 =====
 search:

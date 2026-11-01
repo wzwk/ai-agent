@@ -16,7 +16,7 @@ public class RouteResult {
     private String question;
     /** 命中的项目名（已经展开 RPC 依赖） */
     private List<String> projectNames;
-    /** 命中的 feature 名（来自 sample-gateway 等） */
+    /** 命中的 feature 名（来自 sample-album-bff 等） */
     private List<String> featureNames;
     /** 用于代码检索的关键词（合并 tags + feature keywords + 提取词） */
     private List<String> searchKeywords;

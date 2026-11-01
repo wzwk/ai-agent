@@ -23,7 +23,7 @@ import java.util.stream.Collectors;
  *
  * 输出 JSON：
  * {
- *   "projects": ["sample-gateway", "sample-feed-service"],
+ *   "projects": ["sample-album-bff", "sample-moments-service"],
  *   "features": ["动态页查询"],
  *   "keywords": ["动态", "moments", "feed"],
  *   "non_product": false,
@@ -68,7 +68,7 @@ public class ProjectRouter {
 
         String prompt = buildRouterPrompt(question, all, history);
         String system = """
-                你是商品研发内部 AI 助手的项目路由器。
+                你是代码问答助手的项目路由器。
                 任务：根据用户当前问题（必要时结合近期对话历史），从已知项目清单中挑选最相关的 1-3 个项目，并给出代码检索关键词。
 
                 多轮对话处理（重要）：
@@ -81,7 +81,7 @@ public class ProjectRouter {
                 输出格式：
                 {
                   "projects": ["项目name1"],
-                  "features": ["feature名（来自 sample-gateway 等，没有就空数组）"],
+                  "features": ["feature名（来自 sample-album-bff 等，没有就空数组）"],
                   "keywords": ["关键词1", "关键词2"],
                   "non_product": false,
                   "reason": "简短中文说明"
@@ -171,7 +171,7 @@ public class ProjectRouter {
             }
 
             // 展开 RPC 依赖（多跳）：从命中项目出发，沿项目级/feature 级 rpc_to 与 called_by 反复扩展，
-            // 直到集合不再增长。例如 sample-gateway → content-service → storage-service/search-service。
+            // 直到集合不再增长。例如 sample-album-bff → dasbizpersonal → core-service/commoditysearch。
             Set<String> expanded = new LinkedHashSet<>(filtered);
             boolean changed = true;
             while (changed) {

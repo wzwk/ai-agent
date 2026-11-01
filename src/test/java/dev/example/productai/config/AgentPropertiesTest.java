@@ -9,11 +9,11 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class AgentPropertiesTest {
 
     @Test
-    void usesSixTurnsForNormalUserQuestion() {
+    void usesSixteenTurnsForNormalUserQuestion() {
         AgentProperties properties = new AgentProperties();
 
         assertFalse(properties.isDeepTraceRequest("这个接口在哪里？", null));
-        assertEquals(6, properties.budgetFor("user", false));
+        assertEquals(16, properties.budgetFor("user", false));
         assertEquals(0, properties.graceTurnsFor(false));
     }
 
@@ -22,8 +22,12 @@ class AgentPropertiesTest {
         AgentProperties properties = new AgentProperties();
 
         assertTrue(properties.isDeepTraceRequest("我要查到底，追到最终数据源", null));
-        assertEquals(12, properties.budgetFor("user", true));
-        assertEquals(2, properties.graceTurnsFor(true));
+        assertEquals(48, properties.budgetFor("user", true));
+        assertEquals(16, properties.graceTurnsFor(true));
+        assertEquals(1_000_000, properties.getTokenBudget());
+        assertEquals(2_000_000, properties.getTraceTokenBudget());
+        assertEquals(48_000, properties.getTraceDecisionContextBytes());
+        assertEquals(5, properties.getTraceMaxNoProgressRounds());
     }
 
     @Test
@@ -31,7 +35,7 @@ class AgentPropertiesTest {
         AgentProperties properties = new AgentProperties();
 
         assertTrue(properties.isDeepTraceRequest("分析这个接口", "完整链路，不要停在接口"));
-        assertEquals(12, properties.budgetFor("analyze", true));
+        assertEquals(48, properties.budgetFor("analyze", true));
     }
 
     @Test

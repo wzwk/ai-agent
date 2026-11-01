@@ -89,7 +89,7 @@ public class RagIndexer {
             List<Path> files = new ArrayList<>();
             try (Stream<Path> walk = Files.walk(root)) {
                 walk.filter(Files::isRegularFile)
-                        .filter(f -> f.toString().endsWith(".java"))
+                        .filter(RagIndexer::isIndexableSource)
                         .filter(f -> !isExcluded(f))
                         .filter(f -> f.toFile().length() <= ragProps.getIndex().getMaxFileBytes())
                         .forEach(files::add);
@@ -159,6 +159,15 @@ public class RagIndexer {
                     key, scanned, indexed, skipped, failed, chunks);
         }
         return new IndexResult(scanned, indexed, skipped, failed, chunks, List.copyOf(failures));
+    }
+
+    /**
+     * 当前向量库收录 Java 业务源码和 APISIX 自定义 Lua 插件。
+     * YAML/XML 等配置仍由实时关键词检索负责，避免扩大向量重建规模。
+     */
+    static boolean isIndexableSource(Path file) {
+        String name = file.getFileName().toString().toLowerCase(Locale.ROOT);
+        return name.endsWith(".java") || name.endsWith(".lua");
     }
 
     private boolean isExcluded(Path f) {

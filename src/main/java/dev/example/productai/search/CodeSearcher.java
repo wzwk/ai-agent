@@ -46,7 +46,7 @@ public class CodeSearcher {
     private final AtomicLong contentCacheMisses = new AtomicLong();
 
     /** 项目目录遍历短缓存；避免一次 Agent 请求内多次从根目录 walk。 */
-    private final ConcurrentHashMap<Path, ProjectFileList> projectFileCache = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<ProjectFileKey, ProjectFileList> projectFileCache = new ConcurrentHashMap<>();
 
     public CodeSearcher(SearchProperties searchProps, ProjectsProperties projectsProps) {
         this.searchProps = searchProps;
@@ -92,6 +92,8 @@ public class CodeSearcher {
 
     private record ProjectFileList(long loadedAtMs, List<Path> files) {}
 
+    private record ProjectFileKey(Path root, boolean includeGatewayArtifacts) {}
+
     private record ProjectScanResult(List<SearchResult> hits, int scannedFiles) {}
 
     /** Spring 路由注解，命中次数用来给 Controller 类文件加权 */
@@ -109,7 +111,7 @@ public class CodeSearcher {
 
     /**
      * 引用发现：扫描命中文件的 import，识别它们引用了哪些"其他已配置项目"的包。
-     * 用于把路由没覆盖到的下游服务（如 storage-service / search-service）自动补进检索范围。
+     * 用于把路由没覆盖到的下游服务（如 core-service / commoditysearch）自动补进检索范围。
      *
      * @param hits       首轮命中的文件（按相关性排序）
      * @param candidates 全部已配置项目（提供 packages 包根信息）
@@ -192,6 +194,9 @@ public class CodeSearcher {
                 String body = kw.substring(1);
                 String[] seg = body.split("/");
                 if (seg.length >= 2) {
+                    // 网关常以顶层前缀（如 ^/api）统一转发，完整接口路径本身不会写进路由文件。
+                    // 保留低权重顶层前缀，既能找到网关规则，也不会压过完整路径/Controller 命中。
+                    addPathVariant(expandedKw, kwPathScore, "/" + seg[0], 15);
                     addPathVariant(expandedKw, kwPathScore, "/" + seg[0] + "/" + seg[1], 20);                    // 类级前缀
                     addPathVariant(expandedKw, kwPathScore, "/" + seg[seg.length - 1], 60);                      // 末段方法名（带斜杠）
                     addPathVariant(expandedKw, kwPathScore, seg[seg.length - 1], 60);                            // 末段方法名（无斜杠，匹配 @RequestMapping("xxx") 写法）
@@ -257,7 +262,7 @@ public class CodeSearcher {
                                               List<String> keywords, Set<String> exactPaths,
                                               Map<String, Integer> kwPathScore) {
         List<SearchResult> hits = new ArrayList<>();
-        List<Path> files = projectFiles(root);
+        List<Path> files = projectFiles(project, root);
         int scanned = 0;
         for (Path file : files) {
             if (Thread.currentThread().isInterrupted()) break;
@@ -314,9 +319,11 @@ public class CodeSearcher {
         return new ProjectScanResult(hits, scanned);
     }
 
-    private List<Path> projectFiles(Path root) {
+    private List<Path> projectFiles(ProjectInfo project, Path root) {
+        boolean includeGatewayArtifacts = isGatewayProject(project);
+        ProjectFileKey cacheKey = new ProjectFileKey(root, includeGatewayArtifacts);
         long now = System.currentTimeMillis();
-        ProjectFileList cached = projectFileCache.get(root);
+        ProjectFileList cached = projectFileCache.get(cacheKey);
         if (cached != null && now - cached.loadedAtMs() <= Math.max(0, searchProps.getFileListCacheTtlMs())) {
             return cached.files();
         }
@@ -334,7 +341,7 @@ public class CodeSearcher {
                 @Override
                 public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
                     String name = file.getFileName().toString();
-                    if (!isExcludedFile(name) && isCodeFile(name)) {
+                    if (!isExcludedFile(name) && isSearchableFile(name, includeGatewayArtifacts)) {
                         files.add(file.toAbsolutePath().normalize());
                     }
                     return FileVisitResult.CONTINUE;
@@ -344,8 +351,14 @@ public class CodeSearcher {
             log.error("遍历项目目录失败 root={}", root, e);
         }
         List<Path> immutable = List.copyOf(files);
-        projectFileCache.put(root, new ProjectFileList(now, immutable));
+        projectFileCache.put(cacheKey, new ProjectFileList(now, immutable));
         return immutable;
+    }
+
+    private boolean isGatewayProject(ProjectInfo project) {
+        String name = project == null || project.getName() == null ? "" : project.getName().toLowerCase(Locale.ROOT);
+        String path = project == null || project.getPath() == null ? "" : project.getPath().toLowerCase(Locale.ROOT);
+        return name.contains("apisix") || path.contains("apisix");
     }
 
     private SourceSnapshot sourceSnapshot(Path file) throws IOException {
@@ -540,15 +553,19 @@ public class CodeSearcher {
         return searchProps.getExcludeExts().stream().anyMatch(fileName::endsWith);
     }
 
-    private boolean isCodeFile(String fileName) {
-        // 这里只看后缀，扩展性留给后续。
+    private boolean isSearchableFile(String fileName, boolean includeGatewayArtifacts) {
+        // JSON 是常见的可执行配置来源；APISIX 项目额外纳入 Nginx conf 与路由导出 txt。
+        // txt 不全局开放，避免普通仓库的大量说明/日志样本挤掉真实源码。
         // 不含 .md：项目仓库里的需求/测试文档常整段粘贴源码且含完整 URL，
         // 会把真实源码挤出席位（文档检索走专门的 search_docs 工具）。
         return fileName.endsWith(".java")
+                || fileName.endsWith(".lua")
+                || fileName.endsWith(".json")
                 || fileName.endsWith(".xml")
                 || fileName.endsWith(".yml") || fileName.endsWith(".yaml")
                 || fileName.endsWith(".properties")
-                || fileName.endsWith(".sql");
+                || fileName.endsWith(".sql")
+                || includeGatewayArtifacts && (fileName.endsWith(".conf") || fileName.endsWith(".txt"));
     }
 
     /**

@@ -35,7 +35,7 @@ class AgentExecutorDocSectionTest {
 
     @Test
     void exactFaqAnswerKeepsStepsAndRedactsToken() {
-        AgentExecutor.Harvest harvest = new AgentExecutor.Harvest();
+        AgentHarvest harvest = new AgentHarvest();
         harvest.docHits.put("docs/faq.md", "12|## 团队token失效问题处理\n"
                 + "13|调用 https://example.test/clear?token=secret-value 后重新登录\n");
 
